@@ -6,11 +6,7 @@ import torch
 import pandas as pd
 from typing import Dict, List, Optional
 from rdkit import Chem
-
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', 'PertRF',))
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', 'PertRF', 'src'))
-from dataloader import DatasetWithDrugs, image_transform
+from dataloaders.dataloader import DatasetWithDrugs, image_transform
 
 logger = logging.getLogger(__name__)
 

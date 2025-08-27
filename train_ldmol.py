@@ -22,20 +22,19 @@ from time import time
 import argparse
 import logging
 import os
-from download import find_model
 import pandas as pd
+import sys
+import os
 
 from models import DiT_models
-from diffusion import create_diffusion
-
 from transformers import T5ForConditionalGeneration, T5Tokenizer
 from train_autoencoder import ldmol_autoencoder
 from utils import AE_SMILES_encoder, regexTokenizer, dual_image_encoder # molT5_encoder,
-# from dataset import smi_txt_dataset
 import random
 
 from encoders import ImageEncoder
-from dataset_gdp import create_raw_drug_dataloader
+from dataloaders.dataset_gdp import create_raw_drug_dataloader
+from dataloaders.download import download_model, find_model
 from diffusion.rectified_flow import create_rectified_flow
 
 #################################################################################
@@ -208,7 +207,7 @@ def main(args):
         'bert_config_encoder': './config_encoder.json',
         'embed_dim': 256,
     }
-    tokenizer = regexTokenizer(vocab_path='./vocab_bpe_300_sc.txt', max_len=127)
+    tokenizer = regexTokenizer(vocab_path='/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/dataloaders/vocab_bpe_300_sc.txt', max_len=127)
     ae_model = ldmol_autoencoder(config=ae_config, no_train=True, tokenizer=tokenizer, use_linear=True)
     
     if args.vae:
@@ -376,7 +375,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--global-batch-size", type=int, default=16*6)
     parser.add_argument("--global-seed", type=int, default=0)
-    parser.add_argument("--vae", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/checkpoint_autoencoder.ckpt")  # Choice doesn't affect training
+    parser.add_argument("--vae", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/dataloaders/checkpoint_autoencoder.ckpt")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=10000)

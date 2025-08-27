@@ -7,7 +7,6 @@ from rdkit import RDLogger
 import re
 RDLogger.DisableLog('rdApp.*')
 
-
 @torch.no_grad()
 def AE_SMILES_encoder(sm, ae_model):
     if sm[0][:5] == "[CLS]":    sm = [s[5:] for s in sm]
@@ -249,7 +248,7 @@ def drawRoundRec(draw, color, x, y, w, h, r):
     drawObject.rectangle((x, y + r / 2, x + w, y + h - (r / 2)), fill=color)
 
 class regexTokenizer():
-    def __init__(self,vocab_path='./vocab_bpe_300_sc.txt',max_len=127):
+    def __init__(self,vocab_path='/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/dataloaders/vocab_bpe_300_sc.txt',max_len=127):
         with open(vocab_path,'r') as f:
             x = f.readlines()
             x = [xx.replace('##', '') for xx in x]

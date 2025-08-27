@@ -7,7 +7,7 @@ from scheduler import create_scheduler
 import copy
 from pysmilesutils.augment import MolAugmenter
 from torch.utils.data import DataLoader
-from dataset import SMILESDataset_pretrain
+from dataloaders.dataset import SMILESDataset_pretrain
 import pytorch_lightning as pl
 from pytorch_lightning.strategies import DDPStrategy
 import torch.distributed
