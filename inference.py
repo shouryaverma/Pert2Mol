@@ -33,7 +33,7 @@ warnings.filterwarnings('ignore')
 def sample_with_cfg(model, flow, shape, y_full, pad_mask, 
                    cfg_scale_rna=2.0, cfg_scale_image=2.0, 
                    num_steps=50, device=None):
-    """Sample with classifier-free guidance."""
+    """Sample with proper classifier-free guidance for separate modalities."""
     if device is None:
         device = next(model.parameters()).device
     
@@ -41,30 +41,113 @@ def sample_with_cfg(model, flow, shape, y_full, pad_mask,
     x = torch.randn(*shape, device=device)
     dt = 1.0 / num_steps
     
+    # Pre-compute conditioning variants
+    y_rna_only = y_full.clone()
+    y_rna_only[:, :, :128] = 0  # Zero out image features (first 128 dims)
+    
+    y_image_only = y_full.clone() 
+    y_image_only[:, :, 128:] = 0  # Zero out RNA features (last 64 dims)
+    
+    y_uncond = torch.zeros_like(y_full)  # No conditioning
+    
     for i in range(num_steps):
         t = torch.full((batch_size,), i * dt, device=device)
         t_discrete = (t * 999).long()
         
         with torch.no_grad():
-            # Conditional prediction
+            # Get predictions for all conditioning variants
             cond_velocity = model(x, t_discrete, y=y_full, pad_mask=pad_mask)
+            rna_velocity = model(x, t_discrete, y=y_rna_only, pad_mask=pad_mask)  
+            image_velocity = model(x, t_discrete, y=y_image_only, pad_mask=pad_mask)
+            uncond_velocity = model(x, t_discrete, y=y_uncond, pad_mask=pad_mask)
             
-            # Unconditional prediction
-            uncond_y = torch.zeros_like(y_full)
-            uncond_velocity = model(x, t_discrete, y=uncond_y, pad_mask=pad_mask)
+            # Handle learn_sigma case
+            if cond_velocity.shape[1] == 2 * x.shape[1]:
+                cond_velocity, _ = torch.split(cond_velocity, x.shape[1], dim=1)
+                rna_velocity, _ = torch.split(rna_velocity, x.shape[1], dim=1)
+                image_velocity, _ = torch.split(image_velocity, x.shape[1], dim=1)
+                uncond_velocity, _ = torch.split(uncond_velocity, x.shape[1], dim=1)
             
-            # Apply CFG
-            cfg_scale = (cfg_scale_rna + cfg_scale_image) / 2  # Average for simplicity
-            velocity = uncond_velocity + cfg_scale * (cond_velocity - uncond_velocity)
+            # Apply separate guidance for each modality
+            # Method 1: Additive guidance
+            velocity = (uncond_velocity + 
+                       cfg_scale_rna * (rna_velocity - uncond_velocity) +
+                       cfg_scale_image * (image_velocity - uncond_velocity))
             
-            if velocity.shape[1] == 2 * x.shape[1]:
-                velocity, _ = torch.split(velocity, x.shape[1], dim=1)
+            # Alternative Method 2: Compositional guidance (uncomment to use)
+            # rna_contribution = cfg_scale_rna * (rna_velocity - uncond_velocity)
+            # image_contribution = cfg_scale_image * (image_velocity - uncond_velocity)
+            # velocity = uncond_velocity + 0.5 * (rna_contribution + image_contribution)
+                
+        x = x + dt * velocity 
+    return x
+
+
+@torch.no_grad()
+def sample_with_advanced_cfg(model, flow, shape, y_full, pad_mask,
+                            cfg_scale_rna=2.0, cfg_scale_image=2.0, 
+                            cfg_schedule='constant', num_steps=50, device=None):
+    """Advanced CFG with scheduling and better control."""
+    if device is None:
+        device = next(model.parameters()).device
+    
+    batch_size = shape[0]
+    x = torch.randn(*shape, device=device)
+    dt = 1.0 / num_steps
+    
+    # Pre-compute conditioning variants
+    y_rna_only = y_full.clone()
+    y_rna_only[:, :, :128] = 0
+    
+    y_image_only = y_full.clone() 
+    y_image_only[:, :, 128:] = 0
+    
+    y_uncond = torch.zeros_like(y_full)
+    
+    for i in range(num_steps):
+        t = torch.full((batch_size,), i * dt, device=device)
+        t_discrete = (t * 999).long()
+        
+        # Dynamic CFG scaling based on timestep
+        if cfg_schedule == 'linear_decay':
+            # Start high, decay to 1.0
+            progress = i / num_steps
+            current_cfg_rna = cfg_scale_rna * (1.0 - progress) + 1.0 * progress
+            current_cfg_image = cfg_scale_image * (1.0 - progress) + 1.0 * progress
+        elif cfg_schedule == 'cosine':
+            # Cosine decay
+            progress = i / num_steps
+            current_cfg_rna = 1.0 + (cfg_scale_rna - 1.0) * 0.5 * (1 + math.cos(math.pi * progress))
+            current_cfg_image = 1.0 + (cfg_scale_image - 1.0) * 0.5 * (1 + math.cos(math.pi * progress))
+        else:  # constant
+            current_cfg_rna = cfg_scale_rna
+            current_cfg_image = cfg_scale_image
+        
+        with torch.no_grad():
+            # Batch all predictions for efficiency
+            y_batch = torch.cat([y_full, y_rna_only, y_image_only, y_uncond], dim=0)
+            pad_mask_batch = pad_mask.repeat(4, 1)
+            x_batch = x.repeat(4, 1, 1, 1)
+            
+            # Single forward pass for all variants
+            velocity_batch = model(x_batch, t_discrete.repeat(4), y=y_batch, pad_mask=pad_mask_batch)
+            
+            if velocity_batch.shape[1] == 2 * x.shape[1]:
+                velocity_batch, _ = torch.split(velocity_batch, x.shape[1], dim=1)
+            
+            # Split back to individual predictions
+            cond_velocity, rna_velocity, image_velocity, uncond_velocity = torch.chunk(velocity_batch, 4, dim=0)
+            
+            # Apply guidance
+            velocity = (uncond_velocity + 
+                       current_cfg_rna * (rna_velocity - uncond_velocity) +
+                       current_cfg_image * (image_velocity - uncond_velocity))
                 
         x = x + dt * velocity 
     return x
 
 class ComprehensiveMolecularEvaluator:
-    """Enhanced molecular evaluation with multiple similarity metrics and baselines."""
+    """ molecular evaluation with multiple similarity metrics and baselines."""
     
     def __init__(self, training_smiles=None):
         self.training_smiles = training_smiles or []
@@ -191,68 +274,6 @@ class ComprehensiveMolecularEvaluator:
         except Exception as e:
             print(f"Error calculating novelty: {e}")
             return 0.0
-
-
-class PerturbationAnalyzer:
-    """Analyze perturbation consistency using RNA data."""
-    
-    def __init__(self):
-        pass
-    
-    def calculate_differential_expression_signature(self, control_rna, treatment_rna):
-        """Calculate differential expression signature."""
-        try:
-            control_rna = control_rna.cpu().numpy() if torch.is_tensor(control_rna) else control_rna
-            treatment_rna = treatment_rna.cpu().numpy() if torch.is_tensor(treatment_rna) else treatment_rna
-            
-            # Calculate log fold change (add pseudocount to avoid log(0))
-            pseudocount = 1e-6
-            log_fold_change = np.log2((treatment_rna + pseudocount) / (control_rna + pseudocount))
-            
-            # Z-score normalization
-            de_signature = (log_fold_change - np.mean(log_fold_change)) / (np.std(log_fold_change) + 1e-8)
-            
-            return de_signature
-            
-        except Exception as e:
-            print(f"Error calculating DE signature: {e}")
-            return np.zeros_like(control_rna)
-    
-    def calculate_signature_similarity(self, signature1, signature2, top_k=100):
-        """Calculate similarity between two DE signatures focusing on top genes."""
-        try:
-            # Get top up/down regulated genes
-            top_up_1 = np.argsort(signature1)[-top_k//2:]
-            top_down_1 = np.argsort(signature1)[:top_k//2]
-            signature_genes_1 = np.concatenate([top_up_1, top_down_1])
-            
-            top_up_2 = np.argsort(signature2)[-top_k//2:]
-            top_down_2 = np.argsort(signature2)[:top_k//2]
-            signature_genes_2 = np.concatenate([top_up_2, top_down_2])
-            
-            # Calculate overlap
-            overlap = len(set(signature_genes_1) & set(signature_genes_2))
-            jaccard = overlap / len(set(signature_genes_1) | set(signature_genes_2))
-            
-            # Calculate correlation on signature genes
-            union_genes = list(set(signature_genes_1) | set(signature_genes_2))
-            if len(union_genes) > 1:
-                correlation = np.corrcoef(signature1[union_genes], signature2[union_genes])[0, 1]
-                correlation = correlation if not np.isnan(correlation) else 0.0
-            else:
-                correlation = 0.0
-            
-            return {
-                'jaccard_similarity': jaccard,
-                'signature_correlation': correlation,
-                'gene_overlap': overlap,
-                'combined_score': (jaccard + abs(correlation)) / 2
-            }
-            
-        except Exception as e:
-            print(f"Error calculating signature similarity: {e}")
-            return {'jaccard_similarity': 0.0, 'signature_correlation': 0.0, 'gene_overlap': 0, 'combined_score': 0.0}
-
 
 class BaselineGenerator:
     """Generate baseline molecules for comparison."""
@@ -504,7 +525,7 @@ def diversity_analysis(smiles_list):
 
 def analyze_mechanism_consistency(compound_name, generated_smiles, target_smiles):
     """Analyze if generated molecule is mechanistically consistent."""
-    # Enhanced compound classification
+    # compound classification
     compound_name_lower = compound_name.lower()
     
     mechanism_classes = {
@@ -577,7 +598,7 @@ def analyze_mechanism_consistency(compound_name, generated_smiles, target_smiles
 
 @torch.no_grad()
 def main(args):
-    """Enhanced inference with comprehensive evaluation."""
+    """ inference with comprehensive evaluation."""
     torch.backends.cuda.matmul.allow_tf32 = True
     assert torch.cuda.is_available(), "Inference requires GPU"
     torch.set_grad_enabled(False)
@@ -680,7 +701,6 @@ def main(args):
     
     # Initialize evaluators (will collect training data during inference)
     mol_evaluator = ComprehensiveMolecularEvaluator(training_smiles=[])
-    perturbation_analyzer = PerturbationAnalyzer()
     baseline_generator = BaselineGenerator([])
 
     # Initialize results storage
@@ -693,17 +713,16 @@ def main(args):
     output_file = f'./inference_results_{args.global_seed}.txt'
     detailed_output_file = f'./detailed_results_{args.global_seed}.json'
 
-    # Enhanced header
+    # header
     with open(output_file, 'w') as f:
         f.write("target_smiles\tbest_generated\tcompound_name\tvalidity\t"
             "morgan_r2_sim\tmaccs_sim\trdk_sim\tscaffold_sim\t"
-            "novelty_score\tdrug_score\tperturbation_consistency\t"
-            "mechanism_consistency\tnum_candidates\n")
+            "novelty_score\tdrug_score\tmechanism_consistency\tnum_candidates\n")
 
     start_time = time.time()
 
     # Generate molecules with evaluation (collect training data on-the-fly)
-    for batch_idx, batch in enumerate(tqdm(loader, desc="Enhanced molecular generation")):
+    for batch_idx, batch in enumerate(tqdm(loader, desc="molecular generation")):
         if batch_idx >= args.max_batches and args.max_batches > 0:
             break
             
@@ -715,13 +734,6 @@ def main(args):
         target_smiles = batch['target_smiles']
         compound_names = batch['compound_name']
         training_smiles.extend(target_smiles)
-
-        # Collect RNA signatures for perturbation analysis
-        for i in range(control_rna.shape[0]):
-            de_sig = perturbation_analyzer.calculate_differential_expression_signature(
-                control_rna[i], treatment_rna[i]
-            )
-            training_rna_signatures.append(de_sig)
 
         # Update the molecular evaluator with new training data
         mol_evaluator.training_smiles = training_smiles
@@ -793,7 +805,7 @@ def main(args):
                 best_props = {}
                 validity = 0
             
-            # Enhanced similarity analysis
+            # similarity analysis
             similarity_results = {}
             if validity and target:
                 similarity_results = mol_evaluator.calculate_multi_fingerprint_similarity(
@@ -808,25 +820,6 @@ def main(args):
             
             # Novelty analysis
             novelty_score = mol_evaluator.calculate_novelty_score(best_candidate) if validity else 0.0
-            
-            # Perturbation consistency analysis
-            perturbation_consistency = 0.0
-            if validity:
-                target_de_sig = perturbation_analyzer.calculate_differential_expression_signature(
-                    control_rna[i], treatment_rna[i]
-                )
-                
-                # Find most similar training signature (as proxy for expected effect)
-                best_baseline_similarity = 0.0
-                if training_rna_signatures:  # Only compare if we have signatures
-                    for train_sig in training_rna_signatures[-100:]:  # Use recent signatures
-                        sig_similarity = perturbation_analyzer.calculate_signature_similarity(
-                            target_de_sig, train_sig
-                        )
-                        best_baseline_similarity = max(best_baseline_similarity, 
-                                                    sig_similarity['combined_score'])
-
-                perturbation_consistency = best_baseline_similarity
             
             # Mechanism consistency
             mechanism_analysis = analyze_mechanism_consistency(compound, best_candidate, target)
@@ -850,7 +843,6 @@ def main(args):
                 'druglikeness_score': best_score,
                 'molecular_properties': best_props,
                 'diversity_analysis': diversity_results,
-                'perturbation_consistency': perturbation_consistency,
                 'mechanism_analysis': mechanism_analysis,
                 'baselines': {
                     'random': random_baseline,
@@ -873,9 +865,9 @@ def main(args):
                 
                 f.write(f"{target}\t{best_candidate}\t{compound}\t{validity}\t"
                        f"{morgan_sim:.3f}\t{maccs_sim:.3f}\t{rdk_sim:.3f}\t{scaffold_sim:.3f}\t"
-                       f"{novelty_score:.3f}\t{best_score:.3f}\t{perturbation_consistency:.3f}\t"
-                       f"{mechanism_score:.3f}\t{len(valid_candidates)}\n")
-    
+                       f"{novelty_score:.3f}\t{best_score:.3f}\t{mechanism_score:.3f}\t"
+                       f"{len(valid_candidates)}\n")
+
     # Calculate comprehensive metrics
     total_time = time.time() - start_time
     valid_results = [r for r in results if r['validity'] == 1]
@@ -890,9 +882,8 @@ def main(args):
     
     avg_novelty = np.mean([r['novelty_score'] for r in valid_results]) if valid_results else 0
     avg_druglikeness = np.mean([r['druglikeness_score'] for r in valid_results]) if valid_results else 0
-    avg_perturbation_consistency = np.mean([r['perturbation_consistency'] for r in valid_results]) if valid_results else 0
     
-    # Enhanced property statistics
+    # property statistics
     property_stats = {}
     if molecular_properties:
         extended_props = ['MW', 'LogP', 'HBA', 'HBD', 'TPSA', 'QED', 'BertzCT', 'NumRings']
@@ -922,7 +913,6 @@ def main(args):
     print(f"\nNovelty and Drug-likeness:")
     print(f"  Average novelty score: {avg_novelty:.3f}")
     print(f"  Average drug-likeness score: {avg_druglikeness:.3f}")
-    print(f"  Average perturbation consistency: {avg_perturbation_consistency:.3f}")
     
     print(f"\nDiversity Analysis:")
     overall_diversity = diversity_analysis(all_generated_smiles)
@@ -958,7 +948,6 @@ def main(args):
         
         print(f"  Novelty: {result['novelty_score']:.3f}")
         print(f"  Drug-likeness: {result['druglikeness_score']:.3f}")
-        print(f"  Perturbation consistency: {result['perturbation_consistency']:.3f}")
         
         if result['molecular_properties']:
             props = result['molecular_properties']
@@ -989,7 +978,6 @@ def main(args):
         'novelty_and_druglikeness': {
             'average_novelty': avg_novelty,
             'average_druglikeness': avg_druglikeness,
-            'average_perturbation_consistency': avg_perturbation_consistency
         },
         'diversity_metrics': overall_diversity,
         'property_statistics': property_stats,
