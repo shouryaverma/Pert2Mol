@@ -116,30 +116,45 @@ def AE_SMILES_decoder(pv, model, stochastic=False, k=2, max_length=150):
             # candidate.append(random.choice(candidate_k))
     return candidate
 
-@torch.no_grad()
-def dual_image_encoder(control_images, treatment_images, image_encoder, device):
+def dual_rna_image_encoder(control_images, treatment_images, control_rna, treatment_rna, 
+                          image_encoder, rna_encoder, device,
+                          rna_dropout_prob=0.0, image_dropout_prob=0.0, training=True):
     """
-    Encode paired control and treatment images for dual attention.
+    Encode paired control and treatment images + RNA with selective dropout for CFG.
+    """
+    # Encode images
+    control_img_features = image_encoder(control_images.to(device))
+    treatment_img_features = image_encoder(treatment_images.to(device))
     
-    Args:
-        control_images: Tensor [B, C, H, W]
-        treatment_images: Tensor [B, C, H, W] 
-        image_encoder: ImageEncoder model
-        device: torch device
+    # Encode RNA
+    control_rna_features = rna_encoder(control_rna.to(device))
+    treatment_rna_features = rna_encoder(treatment_rna.to(device))
+    
+    if training:
+        batch_size = control_img_features.shape[0]
         
-    Returns:
-        image_features: Tensor [B, 2, feature_dim]
-        attention_mask: Tensor [B, 2] 
-    """
-    control_features = image_encoder(control_images.to(device))
-    treatment_features = image_encoder(treatment_images.to(device))
+        # Randomly drop RNA features
+        if rna_dropout_prob > 0:
+            rna_mask = torch.rand(batch_size, device=device) > rna_dropout_prob
+            rna_mask = rna_mask.float().unsqueeze(-1)
+            control_rna_features = control_rna_features * rna_mask
+            treatment_rna_features = treatment_rna_features * rna_mask
+        
+        # Randomly drop image features  
+        if image_dropout_prob > 0:
+            img_mask = torch.rand(batch_size, device=device) > image_dropout_prob
+            img_mask = img_mask.float().unsqueeze(-1)
+            control_img_features = control_img_features * img_mask
+            treatment_img_features = treatment_img_features * img_mask
     
-    # Stack for dual attention: [B, 2, feature_dim]
-    image_features = torch.stack([control_features, treatment_features], dim=1)
-    attention_mask = torch.ones(image_features.size(0), 2, dtype=torch.bool, device=device)
+    # Concatenate features
+    control_features = torch.cat([control_img_features, control_rna_features], dim=-1)
+    treatment_features = torch.cat([treatment_img_features, treatment_rna_features], dim=-1)
     
-    return image_features, attention_mask
-
+    combined_features = torch.stack([control_features, treatment_features], dim=1)
+    attention_mask = torch.ones(combined_features.size(0), 2, dtype=torch.bool, device=device)
+    
+    return combined_features, attention_mask
 
 def get_validity(smiles):
     from rdkit import Chem
@@ -166,86 +181,6 @@ acronyms = "([A-Z][.][A-Z][.](?:[A-Z][.])?)"
 websites = "[.](com|net|org|io|gov|edu|me)"
 digits = "([0-9])"
 multiple_dots = r'\.{2,}'
-
-
-def split_into_sentences(text: str) -> list[str]:
-    """
-    Split the text into sentences.
-
-    If the text contains substrings "<prd>" or "<stop>", they would lead
-    to incorrect splitting because they are used as markers for splitting.
-
-    :param text: text to be split into sentences
-    :type text: str
-
-    :return: list of sentences
-    :rtype: list[str]
-    """
-    text = " " + text + "  "
-    text = text.replace("\n", " ")
-    text = re.sub(prefixes, "\\1<prd>", text)
-    text = re.sub(websites, "<prd>\\1", text)
-    text = re.sub(digits + "[.]" + digits, "\\1<prd>\\2", text)
-    text = re.sub(multiple_dots, lambda match: "<prd>" * len(match.group(0)) + "<stop>", text)
-    if "Ph.D" in text: text = text.replace("Ph.D.", "Ph<prd>D<prd>")
-    text = re.sub("\s" + alphabets + "[.] ", " \\1<prd> ", text)
-    text = re.sub(acronyms + " " + starters, "\\1<stop> \\2", text)
-    text = re.sub(alphabets + "[.]" + alphabets + "[.]" + alphabets + "[.]", "\\1<prd>\\2<prd>\\3<prd>", text)
-    text = re.sub(alphabets + "[.]" + alphabets + "[.]", "\\1<prd>\\2<prd>", text)
-    text = re.sub(" " + suffixes + "[.] " + starters, " \\1<stop> \\2", text)
-    text = re.sub(" " + suffixes + "[.]", " \\1<prd>", text)
-    text = re.sub(" " + alphabets + "[.]", " \\1<prd>", text)
-    if "”" in text: text = text.replace(".”", "”.")
-    if "\"" in text: text = text.replace(".\"", "\".")
-    if "!" in text: text = text.replace("!\"", "\"!")
-    if "?" in text: text = text.replace("?\"", "\"?")
-    text = text.replace(".", ".<stop>")
-    text = text.replace("?", "?<stop>")
-    text = text.replace("!", "!<stop>")
-    text = text.replace("<prd>", ".")
-    sentences = text.split("<stop>")
-    sentences = [s.strip() for s in sentences]
-    if sentences and not sentences[-1]: sentences = sentences[:-1]
-    return sentences
-
-
-def center_crop(width, height, img):
-    resample = {'box': Image.BOX, 'lanczos': Image.LANCZOS}['lanczos']
-    crop = np.min(img.shape[:2])
-    img = img[(img.shape[0] - crop) // 2: (img.shape[0] + crop) // 2, (img.shape[1] - crop) // 2: (img.shape[1] + crop) // 2]  # center crop
-    try:
-        img = Image.fromarray(img, 'RGB')
-    except:
-        img = Image.fromarray(img)
-    img = img.resize((width, height), resample)  # resize the center crop from [crop, crop] to [width, height]
-
-    return np.array(img).astype(np.uint8)
-
-
-def set_logger(log_level='info', fname=None):
-    import logging as _logging
-    handler = logging.get_absl_handler()
-    formatter = _logging.Formatter('%(asctime)s - %(filename)s - %(message)s')
-    handler.setFormatter(formatter)
-    logging.set_verbosity(log_level)
-    if fname is not None:
-        handler = _logging.FileHandler(fname)
-        handler.setFormatter(formatter)
-        logging.get_absl_logger().addHandler(handler)
-
-
-def drawRoundRec(draw, color, x, y, w, h, r):
-    drawObject = draw
-
-    '''Rounds'''
-    drawObject.ellipse((x, y, x + r, y + r), fill=color)
-    drawObject.ellipse((x + w - r, y, x + w, y + r), fill=color)
-    drawObject.ellipse((x, y + h - r, x + r, y + h), fill=color)
-    drawObject.ellipse((x + w - r, y + h - r, x + w, y + h), fill=color)
-
-    '''rec.s'''
-    drawObject.rectangle((x + r / 2, y, x + w - (r / 2), y + h), fill=color)
-    drawObject.rectangle((x, y + r / 2, x + w, y + h - (r / 2)), fill=color)
 
 class regexTokenizer():
     def __init__(self,vocab_path='/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/dataloaders/vocab_bpe_300_sc.txt',max_len=127):

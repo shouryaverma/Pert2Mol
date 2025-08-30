@@ -27,12 +27,11 @@ import sys
 import os
 
 from models import DiT_models
-from transformers import T5ForConditionalGeneration, T5Tokenizer
 from train_autoencoder import ldmol_autoencoder
-from utils import AE_SMILES_encoder, regexTokenizer, dual_image_encoder # molT5_encoder,
+from utils import AE_SMILES_encoder, regexTokenizer, dual_rna_image_encoder # molT5_encoder,
 import random
 
-from encoders import ImageEncoder
+from encoders import ImageEncoder, RNAEncoder
 from dataloaders.dataset_gdp import create_raw_drug_dataloader
 from dataloaders.download import download_model, find_model
 from diffusion.rectified_flow import create_rectified_flow
@@ -88,7 +87,85 @@ def create_logger(logging_dir):
     return logger
 
 
-
+def sample_with_cfg(model, flow, shape, y_full, pad_mask, 
+                   cfg_scale_rna=1.0, cfg_scale_image=1.0, 
+                   num_steps=50, device=None):
+    """
+    Sample with classifier-free guidance for RNA and/or image conditioning.
+    
+    Args:
+        y_full: Full conditioning [B, 2, 192] 
+        cfg_scale_rna: CFG scale for RNA (1.0 = no guidance)
+        cfg_scale_image: CFG scale for image (1.0 = no guidance)
+    """
+    if device is None:
+        device = next(model.parameters()).device
+    
+    batch_size = shape[0]
+    
+    # Create conditioning variants
+    y_rna_only = y_full.clone()
+    y_rna_only[:, :, :128] = 0  # Zero out image features
+    
+    y_img_only = y_full.clone() 
+    y_img_only[:, :, 128:] = 0  # Zero out RNA features
+    
+    y_uncond = torch.zeros_like(y_full)  # No conditioning
+    
+    # Stack all variants for batch processing
+    if cfg_scale_rna != 1.0 and cfg_scale_image != 1.0:
+        # Both RNA and image guidance
+        y_batch = torch.cat([y_full, y_rna_only, y_img_only, y_uncond], dim=0)
+        pad_mask_batch = pad_mask.repeat(4, 1)
+        x_batch_shape = (batch_size * 4,) + shape[1:]
+    elif cfg_scale_rna != 1.0:
+        # RNA guidance only
+        y_batch = torch.cat([y_full, y_rna_only], dim=0)
+        pad_mask_batch = pad_mask.repeat(2, 1)
+        x_batch_shape = (batch_size * 2,) + shape[1:]
+    elif cfg_scale_image != 1.0:
+        # Image guidance only  
+        y_batch = torch.cat([y_full, y_img_only], dim=0)
+        pad_mask_batch = pad_mask.repeat(2, 1)
+        x_batch_shape = (batch_size * 2,) + shape[1:]
+    else:
+        # No guidance
+        return flow.sample(model, shape, num_steps=num_steps, 
+                         model_kwargs={'y': y_full, 'pad_mask': pad_mask})
+    
+    # Sample with batched conditioning
+    def cfg_model_fn(x, t, **kwargs):
+        # Get predictions for all variants
+        out = model(x, t, y=y_batch, pad_mask=pad_mask_batch)
+        
+        if cfg_scale_rna != 1.0 and cfg_scale_image != 1.0:
+            # Split predictions
+            out_cond, out_rna, out_img, out_uncond = torch.chunk(out, 4, dim=0)
+            # Apply CFG
+            out_final = out_uncond + cfg_scale_image * (out_img - out_uncond) + cfg_scale_rna * (out_rna - out_uncond)
+        elif cfg_scale_rna != 1.0:
+            out_cond, out_rna = torch.chunk(out, 2, dim=0)
+            out_final = out_rna + cfg_scale_rna * (out_cond - out_rna)
+        elif cfg_scale_image != 1.0:
+            out_cond, out_img = torch.chunk(out, 2, dim=0)
+            out_final = out_img + cfg_scale_image * (out_cond - out_img)
+        
+        return out_final
+    
+    # Custom sampling with CFG model
+    x = torch.randn(*shape, device=device)
+    dt = 1.0 / num_steps
+    
+    for i in range(num_steps):
+        t = torch.full((batch_size,), i * dt, device=device)
+        t_discrete = (t * 999).long()
+        
+        with torch.no_grad():
+            velocity = cfg_model_fn(x, t_discrete)
+        x = x + dt * velocity
+    
+    return x
+    
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
@@ -172,13 +249,12 @@ def main(args):
     # Create model:
     latent_size = 127
     in_channels = 64
-    cross_attn = 256
-    conditioning_dim = 256
+    cross_attn = 192
+    conditioning_dim = 192
     
     model = DiT_models[args.model](
         input_size=latent_size,
         in_channels=in_channels,
-        num_classes=args.num_classes,
         cross_attn=cross_attn,
         condition_dim=conditioning_dim
     )
@@ -230,7 +306,7 @@ def main(args):
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup image encoder
-    image_encoder = ImageEncoder(img_channels=4, output_dim=256).to(device)
+    image_encoder = ImageEncoder(img_channels=4, output_dim=128).to(device)
     if use_ddp:
         image_encoder = DDP(image_encoder, device_ids=[rank])
     
@@ -238,12 +314,23 @@ def main(args):
         param.requires_grad = True
     image_encoder.train()
     print(f'ImageEncoder #parameters: {sum(p.numel() for p in image_encoder.parameters())}, #trainable: {sum(p.numel() for p in image_encoder.parameters() if p.requires_grad)}')
-    
+
+    # Setup rna encoder
+    rna_encoder = RNAEncoder(input_dim=gene_count_matrix.shape[0],output_dim=64,dropout=0.1).to(device)
+    if use_ddp:
+        rna_encoder = DDP(rna_encoder, device_ids=[rank])
+    for param in rna_encoder.parameters():
+        param.requires_grad = True
+    rna_encoder.train()
+    print(f'RNAEncoder #parameters: {sum(p.numel() for p in rna_encoder.parameters())}, #trainable: {sum(p.numel() for p in rna_encoder.parameters() if p.requires_grad)}')
+
     # Create optimizer
     if use_ddp:
-        all_params = list(model.parameters()) + list(image_encoder.parameters())
+        all_params = list(model.parameters()) + list(image_encoder.parameters()) + list(rna_encoder.parameters())
     else:
-        all_params = list(model.parameters()) + list(image_encoder.parameters())
+        all_params = list(model.parameters()) + list(image_encoder.parameters()) + list(rna_encoder.parameters())
+
+    print(f"Total parameters: {sum(p.numel() for p in all_params):,}, trainable: {sum(p.numel() for p in all_params if p.requires_grad):,}")
     opt = torch.optim.AdamW(all_params, lr=1e-4, weight_decay=0)
 
     # Setup data
@@ -283,17 +370,23 @@ def main(args):
                 target_smiles = batch['target_smiles']
                 x = AE_SMILES_encoder(target_smiles, ae_model).permute((0, 2, 1)).unsqueeze(-1)
                 
-            control_imgs = batch['control_images'].to(device)
-            treatment_imgs = batch['treatment_images'].to(device)
-            control_features = image_encoder(control_imgs)
-            treatment_features = image_encoder(treatment_imgs)
-            y = torch.stack([control_features, treatment_features], dim=1)
-            pad_mask = torch.ones(y.size(0), 2, dtype=torch.bool, device=device)
-                
-            # t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
-            # model_kwargs = dict(y=y.type(torch.float32), pad_mask=pad_mask.bool())
-            # loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
-            # loss = loss_dict["loss"].mean()
+            control_imgs = batch['control_images']
+            treatment_imgs = batch['treatment_images']
+            control_rna = batch['control_transcriptomics']
+            treatment_rna = batch['treatment_transcriptomics']
+
+            y, pad_mask = dual_rna_image_encoder(
+                control_imgs, treatment_imgs, control_rna, treatment_rna,
+                image_encoder, rna_encoder, device,
+                rna_dropout_prob=args.rna_dropout_prob,
+                image_dropout_prob=args.image_dropout_prob,
+                training=True
+            )
+
+            # Add explicit CFG training - randomly zero out conditioning
+            if random.random() < 0.15:  # 15% unconditional samples
+                y = torch.zeros_like(y)       
+
             model_kwargs = dict(y=y.type(torch.float32), pad_mask=pad_mask.bool())
             loss_dict = flow.training_losses(model, x, model_kwargs=model_kwargs)
             loss = loss_dict["loss"].mean()
@@ -337,6 +430,7 @@ def main(args):
                         checkpoint = {
                             "model": model.module.state_dict(),
                             "image_encoder": image_encoder.module.state_dict(),
+                            "rna_encoder": rna_encoder.module.state_dict(),
                             "ema": ema.state_dict(),
                             "opt": opt.state_dict(),
                             "args": args
@@ -345,6 +439,7 @@ def main(args):
                         checkpoint = {
                             "model": model.state_dict(),
                             "image_encoder": image_encoder.state_dict(),
+                            "rna_encoder": rna_encoder.state_dict(),    
                             "ema": ema.state_dict(),
                             "opt": opt.state_dict(),
                             "args": args
@@ -368,11 +463,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--ckpt", type=str, default="")
-    parser.add_argument("--text-encoder-name", type=str, default="molt5")
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="LDMol")
-    parser.add_argument("--description-length", type=int, default=256)
-    parser.add_argument("--num-classes", type=int, default=1000)
-    parser.add_argument("--epochs", type=int, default=1400)
+    parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--global-batch-size", type=int, default=16*6)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/dataloaders/checkpoint_autoencoder.ckpt")  # Choice doesn't affect training
@@ -387,6 +479,9 @@ if __name__ == "__main__":
     parser.add_argument("--metadata-control-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/metadata_control.csv")
     parser.add_argument("--metadata-drug-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/metadata_drug.csv")
     parser.add_argument("--gene-count-matrix-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/GDPx1x2_gene_counts.parquet")
+
+    parser.add_argument("--rna-dropout-prob", type=float, default=0.1, help="RNA dropout probability for CFG")
+    parser.add_argument("--image-dropout-prob", type=float, default=0.1, help="Image dropout probability for CFG")
     args = parser.parse_args()
 
     print(args)

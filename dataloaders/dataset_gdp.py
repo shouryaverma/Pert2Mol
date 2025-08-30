@@ -4,6 +4,7 @@ import logging
 import json
 import torch
 import pandas as pd
+import numpy as np
 from typing import Dict, List, Optional
 from rdkit import Chem
 from dataloaders.dataloader import DatasetWithDrugs, image_transform
@@ -225,6 +226,7 @@ def create_raw_drug_dataloader(
         adata.layers['counts'] = adata.X.copy()
         sc.pp.normalize_total(adata, target_sum=1e6)
         sc.pp.log1p(adata)
+        # adata.X = np.nan_to_num(adata.X, nan=0.0, posinf=0.0, neginf=0.0)
         sc.pp.highly_variable_genes(adata, n_top_genes=n_top_genes)
         hvg_genes = adata.var_names[adata.var['highly_variable']]
         

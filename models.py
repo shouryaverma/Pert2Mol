@@ -133,37 +133,6 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 
-class LabelEmbedder(nn.Module):
-    """
-    Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
-    """
-
-    def __init__(self, num_classes, hidden_size, dropout_prob):
-        super().__init__()
-        use_cfg_embedding = dropout_prob > 0
-        self.embedding_table = nn.Embedding(num_classes + use_cfg_embedding, hidden_size)
-        self.num_classes = num_classes
-        self.dropout_prob = dropout_prob
-
-    def token_drop(self, labels, force_drop_ids=None):
-        """
-        Drops labels to enable classifier-free guidance.
-        """
-        if force_drop_ids is None:
-            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
-        else:
-            drop_ids = force_drop_ids == 1
-        labels = torch.where(drop_ids, self.num_classes, labels)
-        return labels
-
-    def forward(self, labels, train, force_drop_ids=None):
-        use_dropout = self.dropout_prob > 0
-        if (train and use_dropout) or (force_drop_ids is not None):
-            labels = self.token_drop(labels, force_drop_ids)
-        embeddings = self.embedding_table(labels)
-        return embeddings
-
-
 #################################################################################
 #                                 Core DiT Model                                #
 #################################################################################
@@ -237,9 +206,6 @@ class DiT(nn.Module):
             depth=28,
             num_heads=16,
             mlp_ratio=4.0,
-            class_dropout_prob=0.1,
-            num_classes=1000,
-            # learn_sigma=True, cross_attn=0, condition_dim=4096
             learn_sigma=True, cross_attn=256, condition_dim=256
     ):
         super().__init__()
@@ -250,11 +216,10 @@ class DiT(nn.Module):
         self.num_heads = num_heads
 
         self.input_size = input_size
-        # self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.x_embedder = nn.Linear(in_channels, hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         self.y_linear = nn.Linear(condition_dim, cross_attn)
+        self.y_to_hidden = nn.Linear(condition_dim, hidden_size)
         num_patches = input_size  # self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -276,7 +241,8 @@ class DiT(nn.Module):
         self.apply(_basic_init)
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], self.input_size)  # int(self.x_embedder.num_patches ** 0.5)
+        # pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], self.input_size)  # int(self.x_embedder.num_patches ** 0.5)
+        pos_embed = get_1d_sincos_pos_embed_from_grid(self.pos_embed.shape[-1], np.arange(self.input_size))
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
@@ -285,7 +251,7 @@ class DiT(nn.Module):
         # nn.init.constant_(self.x_embedder.proj.bias, 0)
 
         # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        # nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -327,12 +293,18 @@ class DiT(nn.Module):
         x = x.squeeze(-1).permute((0, 2, 1))
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)  # (N, D)
-        # y = self.y_embedder(y, self.training)    # (N, D)
-        if y is not None:   y = self.y_linear(y)
-        # c = t + y                                # (N, D)
-        c = t  # (N, D)
+        if y is not None:   
+            # Handle the stacked [control, treatment] features
+            y_for_cross_attn = self.y_linear(y)  # Keep original for cross-attention
+            y_pooled = y.mean(dim=1)  # Pool control+treatment: [B, 2, 192] -> [B, 192]
+            y_pooled = self.y_to_hidden(y_pooled)  # Project to hidden_size: [B, 192] -> [B, 768]
+        else:
+            y_for_cross_attn = None
+            y_pooled = torch.zeros_like(t)  # Match timestep embedding dimensions
+
+        c = t + y_pooled  # Now both are [B, 768]
         for block in self.blocks:
-            x = block(x, c, y, pad_mask)  # (N, T, D)
+            x = block(x, c, y_for_cross_attn, pad_mask)  # (N, T, D)
         x = self.final_layer(x, c).permute((0, 2, 1)).unsqueeze(-1)  # (N, T, patch_size ** 2 * out_channels)
         # x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x

@@ -1,2 +1,6 @@
 *.ckpt
 *.pyc
+*.out
+*.pt
+*.txt
+results/
