@@ -30,10 +30,10 @@ import random
 warnings.filterwarnings('ignore')
 
 @torch.no_grad()
-def sample_with_cfg(model, flow, shape, y_full, pad_mask, 
-                   cfg_scale_rna=2.0, cfg_scale_image=2.0, 
+def sample_with_cfg(model, flow, shape, y_full, pad_mask,
+                   cfg_scale_rna=2.0, cfg_scale_image=2.0,
                    num_steps=50, device=None):
-    """Sample with proper classifier-free guidance for separate modalities."""
+    """Sample with compositional CFG using both modality baselines."""
     if device is None:
         device = next(model.parameters()).device
     
@@ -43,105 +43,34 @@ def sample_with_cfg(model, flow, shape, y_full, pad_mask,
     
     # Pre-compute conditioning variants
     y_rna_only = y_full.clone()
-    y_rna_only[:, :, :128] = 0  # Zero out image features (first 128 dims)
+    y_rna_only[:, :, :128] = 0  # Zero out image features
     
     y_image_only = y_full.clone() 
-    y_image_only[:, :, 128:] = 0  # Zero out RNA features (last 64 dims)
-    
-    y_uncond = torch.zeros_like(y_full)  # No conditioning
+    y_image_only[:, :, 128:] = 0  # Zero out RNA features
     
     for i in range(num_steps):
         t = torch.full((batch_size,), i * dt, device=device)
         t_discrete = (t * 999).long()
-        
-        with torch.no_grad():
-            # Get predictions for all conditioning variants
-            cond_velocity = model(x, t_discrete, y=y_full, pad_mask=pad_mask)
-            rna_velocity = model(x, t_discrete, y=y_rna_only, pad_mask=pad_mask)  
-            image_velocity = model(x, t_discrete, y=y_image_only, pad_mask=pad_mask)
-            uncond_velocity = model(x, t_discrete, y=y_uncond, pad_mask=pad_mask)
-            
-            # Handle learn_sigma case
-            if cond_velocity.shape[1] == 2 * x.shape[1]:
-                cond_velocity, _ = torch.split(cond_velocity, x.shape[1], dim=1)
-                rna_velocity, _ = torch.split(rna_velocity, x.shape[1], dim=1)
-                image_velocity, _ = torch.split(image_velocity, x.shape[1], dim=1)
-                uncond_velocity, _ = torch.split(uncond_velocity, x.shape[1], dim=1)
-            
-            # Apply separate guidance for each modality
-            # Method 1: Additive guidance
-            velocity = (uncond_velocity + 
-                       cfg_scale_rna * (rna_velocity - uncond_velocity) +
-                       cfg_scale_image * (image_velocity - uncond_velocity))
-            
-            # Alternative Method 2: Compositional guidance (uncomment to use)
-            # rna_contribution = cfg_scale_rna * (rna_velocity - uncond_velocity)
-            # image_contribution = cfg_scale_image * (image_velocity - uncond_velocity)
-            # velocity = uncond_velocity + 0.5 * (rna_contribution + image_contribution)
-                
-        x = x + dt * velocity 
-    return x
-
-
-@torch.no_grad()
-def sample_with_advanced_cfg(model, flow, shape, y_full, pad_mask,
-                            cfg_scale_rna=2.0, cfg_scale_image=2.0, 
-                            cfg_schedule='constant', num_steps=50, device=None):
-    """Advanced CFG with scheduling and better control."""
-    if device is None:
-        device = next(model.parameters()).device
-    
-    batch_size = shape[0]
-    x = torch.randn(*shape, device=device)
-    dt = 1.0 / num_steps
-    
-    # Pre-compute conditioning variants
-    y_rna_only = y_full.clone()
-    y_rna_only[:, :, :128] = 0
-    
-    y_image_only = y_full.clone() 
-    y_image_only[:, :, 128:] = 0
-    
-    y_uncond = torch.zeros_like(y_full)
-    
-    for i in range(num_steps):
-        t = torch.full((batch_size,), i * dt, device=device)
-        t_discrete = (t * 999).long()
-        
-        # Dynamic CFG scaling based on timestep
-        if cfg_schedule == 'linear_decay':
-            # Start high, decay to 1.0
-            progress = i / num_steps
-            current_cfg_rna = cfg_scale_rna * (1.0 - progress) + 1.0 * progress
-            current_cfg_image = cfg_scale_image * (1.0 - progress) + 1.0 * progress
-        elif cfg_schedule == 'cosine':
-            # Cosine decay
-            progress = i / num_steps
-            current_cfg_rna = 1.0 + (cfg_scale_rna - 1.0) * 0.5 * (1 + math.cos(math.pi * progress))
-            current_cfg_image = 1.0 + (cfg_scale_image - 1.0) * 0.5 * (1 + math.cos(math.pi * progress))
-        else:  # constant
-            current_cfg_rna = cfg_scale_rna
-            current_cfg_image = cfg_scale_image
         
         with torch.no_grad():
             # Batch all predictions for efficiency
-            y_batch = torch.cat([y_full, y_rna_only, y_image_only, y_uncond], dim=0)
-            pad_mask_batch = pad_mask.repeat(4, 1)
-            x_batch = x.repeat(4, 1, 1, 1)
+            y_batch = torch.cat([y_full, y_rna_only, y_image_only], dim=0)
+            pad_mask_batch = pad_mask.repeat(3, 1)
+            x_batch = x.repeat(3, 1, 1, 1)
             
-            # Single forward pass for all variants
-            velocity_batch = model(x_batch, t_discrete.repeat(4), y=y_batch, pad_mask=pad_mask_batch)
+            velocity_batch = model(x_batch, t_discrete.repeat(3), y=y_batch, pad_mask=pad_mask_batch)
             
             if velocity_batch.shape[1] == 2 * x.shape[1]:
                 velocity_batch, _ = torch.split(velocity_batch, x.shape[1], dim=1)
             
-            # Split back to individual predictions
-            cond_velocity, rna_velocity, image_velocity, uncond_velocity = torch.chunk(velocity_batch, 4, dim=0)
+            # Split predictions
+            cond_velocity, rna_velocity, image_velocity = torch.chunk(velocity_batch, 3, dim=0)
             
-            # Apply guidance
-            velocity = (uncond_velocity + 
-                       current_cfg_rna * (rna_velocity - uncond_velocity) +
-                       current_cfg_image * (image_velocity - uncond_velocity))
+            # Compositional CFG: guide each modality toward full conditioning
+            velocity = (rna_velocity + 
+                       cfg_scale_rna * (cond_velocity - rna_velocity) +
+                       image_velocity + 
+                       cfg_scale_image * (cond_velocity - image_velocity)) / 2
                 
         x = x + dt * velocity 
     return x

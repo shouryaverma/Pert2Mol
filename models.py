@@ -293,6 +293,7 @@ class DiT(nn.Module):
         x = x.squeeze(-1).permute((0, 2, 1))
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)  # (N, D)
+
         if y is not None:   
             # Handle the stacked [control, treatment] features
             y_for_cross_attn = self.y_linear(y)  # Keep original for cross-attention
@@ -303,10 +304,11 @@ class DiT(nn.Module):
             y_pooled = torch.zeros_like(t)  # Match timestep embedding dimensions
 
         c = t + y_pooled  # Now both are [B, 768]
+
         for block in self.blocks:
             x = block(x, c, y_for_cross_attn, pad_mask)  # (N, T, D)
         x = self.final_layer(x, c).permute((0, 2, 1)).unsqueeze(-1)  # (N, T, patch_size ** 2 * out_channels)
-        # x = self.unpatchify(x)                   # (N, out_channels, H, W)
+        
         return x
 
     def forward_with_cfg(self, x, t, y, pad_mask, cfg_scale):

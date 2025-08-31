@@ -110,14 +110,12 @@ def sample_with_cfg(model, flow, shape, y_full, pad_mask,
     y_img_only = y_full.clone() 
     y_img_only[:, :, 128:] = 0  # Zero out RNA features
     
-    y_uncond = torch.zeros_like(y_full)  # No conditioning
-    
     # Stack all variants for batch processing
     if cfg_scale_rna != 1.0 and cfg_scale_image != 1.0:
         # Both RNA and image guidance
-        y_batch = torch.cat([y_full, y_rna_only, y_img_only, y_uncond], dim=0)
-        pad_mask_batch = pad_mask.repeat(4, 1)
-        x_batch_shape = (batch_size * 4,) + shape[1:]
+        y_batch = torch.cat([y_full, y_rna_only, y_img_only], dim=0)
+        pad_mask_batch = pad_mask.repeat(3, 1)
+        x_batch_shape = (batch_size * 3,) + shape[1:]
     elif cfg_scale_rna != 1.0:
         # RNA guidance only
         y_batch = torch.cat([y_full, y_rna_only], dim=0)
@@ -140,9 +138,9 @@ def sample_with_cfg(model, flow, shape, y_full, pad_mask,
         
         if cfg_scale_rna != 1.0 and cfg_scale_image != 1.0:
             # Split predictions
-            out_cond, out_rna, out_img, out_uncond = torch.chunk(out, 4, dim=0)
-            # Apply CFG
-            out_final = out_uncond + cfg_scale_image * (out_img - out_uncond) + cfg_scale_rna * (out_rna - out_uncond)
+            out_cond, out_rna, out_img = torch.chunk(out, 3, dim=0)
+            # Apply CFG relative to image-only baseline
+            out_final = out_img + cfg_scale_image * (out_cond - out_img) + cfg_scale_rna * (out_rna - out_img)
         elif cfg_scale_rna != 1.0:
             out_cond, out_rna = torch.chunk(out, 2, dim=0)
             out_final = out_rna + cfg_scale_rna * (out_cond - out_rna)
@@ -377,15 +375,22 @@ def main(args):
 
             y, pad_mask = dual_rna_image_encoder(
                 control_imgs, treatment_imgs, control_rna, treatment_rna,
-                image_encoder, rna_encoder, device,
-                rna_dropout_prob=args.rna_dropout_prob,
-                image_dropout_prob=args.image_dropout_prob,
-                training=True
+                image_encoder, rna_encoder, device
             )
 
-            # Add explicit CFG training - randomly zero out conditioning
-            if random.random() < 0.15:  # 15% unconditional samples
-                y = torch.zeros_like(y)       
+            # CFG training with three conditioning variants
+            dropout_choice = torch.rand(y.shape[0], device=device)
+
+            # 0.0-0.1: RNA-only (zero out image features)
+            # 0.1-0.2: Image-only (zero out RNA features) 
+            # 0.2-1.0: Full conditioning
+
+            rna_only_mask = (dropout_choice < 0.1).float().view(-1, 1, 1)
+            image_only_mask = ((dropout_choice >= 0.1) & (dropout_choice < 0.2)).float().view(-1, 1, 1)
+
+            # Apply masks
+            y[:, :, :128] = y[:, :, :128] * (1 - rna_only_mask)  # Zero out images for RNA-only
+            y[:, :, 128:] = y[:, :, 128:] * (1 - image_only_mask)  # Zero out RNA for image-only
 
             model_kwargs = dict(y=y.type(torch.float32), pad_mask=pad_mask.bool())
             loss_dict = flow.training_losses(model, x, model_kwargs=model_kwargs)
@@ -479,9 +484,7 @@ if __name__ == "__main__":
     parser.add_argument("--metadata-control-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/metadata_control.csv")
     parser.add_argument("--metadata-drug-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/metadata_drug.csv")
     parser.add_argument("--gene-count-matrix-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/GDPx1x2_gene_counts.parquet")
-
-    parser.add_argument("--rna-dropout-prob", type=float, default=0.1, help="RNA dropout probability for CFG")
-    parser.add_argument("--image-dropout-prob", type=float, default=0.1, help="Image dropout probability for CFG")
+    
     args = parser.parse_args()
 
     print(args)

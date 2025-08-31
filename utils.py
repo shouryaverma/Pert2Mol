@@ -117,8 +117,7 @@ def AE_SMILES_decoder(pv, model, stochastic=False, k=2, max_length=150):
     return candidate
 
 def dual_rna_image_encoder(control_images, treatment_images, control_rna, treatment_rna, 
-                          image_encoder, rna_encoder, device,
-                          rna_dropout_prob=0.0, image_dropout_prob=0.0, training=True):
+                          image_encoder, rna_encoder, device):
     """
     Encode paired control and treatment images + RNA with selective dropout for CFG.
     """
@@ -129,23 +128,6 @@ def dual_rna_image_encoder(control_images, treatment_images, control_rna, treatm
     # Encode RNA
     control_rna_features = rna_encoder(control_rna.to(device))
     treatment_rna_features = rna_encoder(treatment_rna.to(device))
-    
-    if training:
-        batch_size = control_img_features.shape[0]
-        
-        # Randomly drop RNA features
-        if rna_dropout_prob > 0:
-            rna_mask = torch.rand(batch_size, device=device) > rna_dropout_prob
-            rna_mask = rna_mask.float().unsqueeze(-1)
-            control_rna_features = control_rna_features * rna_mask
-            treatment_rna_features = treatment_rna_features * rna_mask
-        
-        # Randomly drop image features  
-        if image_dropout_prob > 0:
-            img_mask = torch.rand(batch_size, device=device) > image_dropout_prob
-            img_mask = img_mask.float().unsqueeze(-1)
-            control_img_features = control_img_features * img_mask
-            treatment_img_features = treatment_img_features * img_mask
     
     # Concatenate features
     control_features = torch.cat([control_img_features, control_rna_features], dim=-1)
