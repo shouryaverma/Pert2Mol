@@ -18,7 +18,7 @@ import networkx as nx
 from collections import defaultdict
 from rdkit import Chem
 from rdkit.Chem import Descriptors, rdMolDescriptors, AllChem, RDKFingerprint
-
+from datasets import load_dataset
 import warnings
 os.environ['RDKit_SILENCE_WARNINGS'] = '1'
 import rdkit
@@ -96,8 +96,8 @@ class HistologyTranscriptomicsDataset(Dataset):
     def __init__(self, 
                  metadata_control: pd.DataFrame,
                  metadata_drug: pd.DataFrame, 
-                 gene_count_matrix: pd.DataFrame,
-                 image_json_dict: Dict[str, List[str]],
+                 gene_count_matrix: pd.DataFrame = None,
+                 image_json_dict: Dict[str, List[str]] = None,
                  transform: Optional[Callable] = None,
                  target_size: Optional[int] = None,
                  ):
@@ -117,6 +117,8 @@ class HistologyTranscriptomicsDataset(Dataset):
         self.image_json_dict = image_json_dict
         self.transform = transform
         self.target_size = target_size
+
+        logger.info(f"`self.metadata_drug.columns`={self.metadata_drug.columns.tolist()}")
 
         # Convert relevant columns to appropriate types
         for k in ['sample_id', 'cell_line', 'json_key', 'compound']:
@@ -162,7 +164,8 @@ class HistologyTranscriptomicsDataset(Dataset):
         """
         image_paths = self.image_json_dict.get(json_key, [])
         if not image_paths:
-            raise ValueError(f"No images found for json_key: {json_key}")
+            logger.debug(f"No images found for json_key: \"{json_key}\"")
+            return np.zeros((4, self.target_size or 512, self.target_size or 512), dtype=np.float32)
         
         # Sort paths to ensure consistent channel order (w1, w2, w3, w4)
         image_paths = sorted(image_paths)
@@ -201,7 +204,8 @@ class HistologyTranscriptomicsDataset(Dataset):
         
         return images
     
-    def get_transcriptomics_data(self, sample_id: str, normalize: bool = False) -> np.ndarray:
+    def get_transcriptomics_data(self, sample_id: str, normalize: bool = False, 
+                                 ran_default_size: int=128) -> np.ndarray:
         """
         Extract transcriptomics data for a given sample_id.
         
@@ -215,11 +219,13 @@ class HistologyTranscriptomicsDataset(Dataset):
             logger.error(f"self.gene_count_matrix.columns[:10]={self.gene_count_matrix.columns[:10].tolist()}")
             logger.error(f"\"{sample_id}\" in self.gene_count_matrix.columns={sample_id in self.gene_count_matrix.columns}")
             logger.error(f"gene_count_matrix.shape={self.gene_count_matrix.shape}")
-            raise ValueError(f"Sample ID {sample_id} not found in gene count matrix")
+            logger.warning(f"Sample ID {sample_id} not found in gene count matrix")
+            return np.zeros((ran_default_size,), dtype=np.float32)
         
         if not normalize:
             return self.gene_count_matrix[sample_id].values.astype(np.float32)
         
+        logger.warning("[DEPRECATED] Normalization in get_transcriptomics_data is deprecated. Use external preprocessing.")
         raw_data = self.gene_count_matrix[sample_id].values.astype(np.float32)
         
         # Apply the SAME transformation as the encoder
@@ -264,26 +270,26 @@ class HistologyTranscriptomicsDataset(Dataset):
         control_transcriptomics = self.get_transcriptomics_data(control_sample['sample_id'])
         
         # Load multi-channel images
-        treatment_images = self.load_multi_channel_images(treatment_sample['json_key'])
-        control_images = self.load_multi_channel_images(control_sample['json_key'])
+        treatment_images = self.load_multi_channel_images(treatment_sample.get('json_key', ''))
+        control_images = self.load_multi_channel_images(control_sample.get('json_key',''))
         
         # Prepare conditioning information
         conditioning_info = {
             'treatment': treatment_sample['compound'],
             'cell_line': cell_line,
-            'timepoint': treatment_sample['timepoint'],
-            'compound_concentration_in_uM': treatment_sample['compound_concentration_in_uM']
+            'timepoint': treatment_sample.get('timepoint', 24.0),
+            'compound_concentration_in_uM': treatment_sample.get('compound_concentration_in_uM', 1.)
         }
 
-        if np.isnan(conditioning_info['timepoint']) or np.isnan(conditioning_info['compound_concentration_in_uM']):
+        if np.isnan(conditioning_info.get('timepoint',24.)) or np.isnan(conditioning_info.get('compound_concentration_in_uM', 1.)):
             raise ValueError(f"NaN in conditioning info: {conditioning_info}")
 
         # Return paired data as tensors (CORRECTED - fixed image assignment)
         return {
             'control_transcriptomics': torch.tensor(control_transcriptomics),
             'treatment_transcriptomics': torch.tensor(treatment_transcriptomics),
-            'control_images': torch.tensor(control_images),      # FIXED
-            'treatment_images': torch.tensor(treatment_images),  # FIXED
+            'control_images': torch.tensor(control_images),
+            'treatment_images': torch.tensor(treatment_images),
             'conditioning_info': conditioning_info
         }
 
@@ -322,6 +328,87 @@ def image_transform(images):
     return enhanced_images.astype(np.float32)
 
 
+def load_drug_data_hdf5(file_path: str) -> dict:
+    """
+    Load drug data from HDF5 with exact same structure as pickle version.
+    Drop-in replacement for load_preprocessed_drug_data.
+    """
+    loaded_data = {}
+    
+    with h5py.File(file_path, 'r') as f:
+        # Load metadata from attributes
+        for key in f.attrs.keys():
+            attr_value = f.attrs[key]
+            if isinstance(attr_value, bytes):
+                attr_value = attr_value.decode('utf-8')
+            
+            # Try to parse as JSON for complex structures
+            if key in ['modality_dims', 'dataset_stats', 'preprocessing_params']:
+                try:
+                    loaded_data[key] = json.loads(attr_value)
+                except (json.JSONDecodeError, TypeError):
+                    loaded_data[key] = attr_value
+            else:
+                loaded_data[key] = attr_value
+        
+        # Load drug embeddings
+        drug_embeddings = {}
+        if 'drug_embeddings' in f:
+            for compound_name in f['drug_embeddings'].keys():
+                compound_group = f['drug_embeddings'][compound_name]
+                embeddings = {}
+                
+                # Load datasets (numpy arrays) - check type first
+                for dataset_name in compound_group.keys():
+                    item = compound_group[dataset_name]
+                    if isinstance(item, h5py.Dataset):
+                        embeddings[dataset_name] = item[:]
+                    # Skip groups - they should not be here for embeddings
+                
+                # Load attributes (scalars, strings)
+                for attr_name in compound_group.attrs.keys():
+                    attr_value = compound_group.attrs[attr_name]
+                    if isinstance(attr_value, bytes):
+                        attr_value = attr_value.decode('utf-8')
+                    embeddings[attr_name] = attr_value
+                
+                drug_embeddings[compound_name] = embeddings
+        
+        loaded_data['drug_embeddings'] = drug_embeddings
+        
+        # Load compound metadata
+        compound_metadata = {}
+        if 'compound_metadata' in f:
+            for compound_name in f['compound_metadata'].keys():
+                metadata_group = f['compound_metadata'][compound_name]
+                metadata = {}
+                
+                for attr_name in metadata_group.attrs.keys():
+                    attr_value = metadata_group.attrs[attr_name]
+                    if isinstance(attr_value, bytes):
+                        attr_value = attr_value.decode('utf-8')
+                    
+                    # Try to convert back to appropriate type
+                    if attr_name in ['cid']:
+                        try:
+                            metadata[attr_name] = int(attr_value)
+                        except (ValueError, TypeError):
+                            metadata[attr_name] = attr_value
+                    elif attr_name in ['molecular_weight']:
+                        try:
+                            metadata[attr_name] = float(attr_value)
+                        except (ValueError, TypeError):
+                            metadata[attr_name] = attr_value
+                    else:
+                        metadata[attr_name] = attr_value
+                
+                compound_metadata[compound_name] = metadata
+        
+        loaded_data['compound_metadata'] = compound_metadata
+    
+    return loaded_data
+
+
 class DatasetWithDrugs(HistologyTranscriptomicsDataset):
     """
     Dataset that includes drug conditioning information.
@@ -329,9 +416,9 @@ class DatasetWithDrugs(HistologyTranscriptomicsDataset):
     def __init__(self,
                 metadata_control: pd.DataFrame,
                 metadata_drug: pd.DataFrame,
-                gene_count_matrix: pd.DataFrame,
-                image_json_dict: Dict[str, List[str]],
                 drug_data_path: str,
+                gene_count_matrix: pd.DataFrame = None,
+                image_json_dict: Dict[str, List[str]] = None,
                 transform: Optional[Callable] = None,
                 target_size: Optional[int] = None,
                 drug_encoder: Optional[torch.nn.Module] = None,
@@ -343,7 +430,9 @@ class DatasetWithDrugs(HistologyTranscriptomicsDataset):
                 fallback_smiles_dict=None,
                 enable_smiles_fallback=False,
                 smiles_cache: Optional[Dict] = None,
-                smiles_only: bool = False  # New parameter
+                smiles_only: bool = False,
+                cell_line_label: str = 'cell_line',
+                compound_name_label: str = 'compound',
                 ):
         """
         Args:
@@ -363,23 +452,23 @@ class DatasetWithDrugs(HistologyTranscriptomicsDataset):
             
             # Filter by specific cell lines if provided
             if debug_cell_lines:
-                metadata_drug = metadata_drug[metadata_drug['cell_line'].isin(debug_cell_lines)]
-                metadata_control = metadata_control[metadata_control['cell_line'].isin(debug_cell_lines)]
+                metadata_drug = metadata_drug[metadata_drug[cell_line_label].isin(debug_cell_lines)]
+                metadata_control = metadata_control[metadata_control[cell_line_label].isin(debug_cell_lines)]
                 print(f"DEBUG MODE: Filtered to cell lines: {debug_cell_lines}")
             
             if debug_drugs:
-                metadata_drug = metadata_drug[metadata_drug['compound'].isin(debug_drugs)]
+                metadata_drug = metadata_drug[metadata_drug[compound_name_label].isin(debug_drugs)]
                 print(f"DEBUG MODE: Filtered to drugs: {debug_drugs}")
             
             if exclude_drugs:
-                metadata_drug = metadata_drug[~metadata_drug['compound'].isin(exclude_drugs)]
+                metadata_drug = metadata_drug[~metadata_drug[compound_name_label].isin(exclude_drugs)]
                 print(f"DEBUG MODE: Excluded drugs: {exclude_drugs}")
             
             # Take only first N samples for debugging
             if debug_samples is not None and debug_samples > 0 and len(metadata_drug) > debug_samples:
                 metadata_drug = metadata_drug.head(debug_samples).reset_index(drop=True)
             else:
-                logger.warning("DEBUG MODE: debug_samples is None or larger than dataset size; not limiting samples.")
+                logger.warning("DEBUG MODE FALLBACK: debug_samples is None or larger than dataset size; not limiting samples.")
             
             # Ensure indices are reset after filtering
             metadata_drug = metadata_drug.reset_index(drop=True)
@@ -529,8 +618,13 @@ class DatasetWithDrugs(HistologyTranscriptomicsDataset):
     def _load_drug_data(self, drug_data_path: str) -> Dict:
         """Load preprocessed drug data."""
         try:
-            with open(drug_data_path, 'rb') as f:
-                drug_data = pickle.load(f)
+            if drug_data_path.endswith('.pickle'):
+                with open(drug_data_path, 'rb') as f:
+                    drug_data = pickle.load(f)
+            elif drug_data_path.endswith('.h5') or drug_data_path.endswith('.hdf5'):
+                drug_data = load_drug_data_hdf5(drug_data_path)
+            else:
+                raise ValueError("Unsupported drug data file format. Use .pickle or .h5/.hdf5")
             logger.info(f"Loaded preprocessed drug data from {drug_data_path}")
             return drug_data
         except Exception as e:

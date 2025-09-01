@@ -33,10 +33,10 @@ class RawDrugDataset(DatasetWithDrugs):
     def __init__(self,
                 metadata_control: pd.DataFrame,
                 metadata_drug: pd.DataFrame,
-                gene_count_matrix: pd.DataFrame,
-                image_json_dict: Dict[str, List[str]],
                 drug_data_path: str = None,
                 raw_drug_csv_path: str = None,
+                gene_count_matrix: pd.DataFrame = None,
+                image_json_dict: Dict[str, List[str]] = None,
                 transform=None,
                 target_size=256,
                 debug_mode=False,
@@ -163,10 +163,10 @@ class RawDrugDataset(DatasetWithDrugs):
 def create_raw_drug_dataloader(
     metadata_control: pd.DataFrame,
     metadata_drug: pd.DataFrame,
-    gene_count_matrix: pd.DataFrame,
-    image_json_path: str,
     drug_data_path: str,
     raw_drug_csv_path: str,
+    image_json_path: str = None,
+    gene_count_matrix: pd.DataFrame = None,
     compound_name_label='compound',
     batch_size: int = 2,
     shuffle: bool = True,
@@ -178,7 +178,7 @@ def create_raw_drug_dataloader(
     normalize: bool = True,
     zscore: bool = True,
     debug_mode: bool = False,
-    debug_samples: int = None,
+    debug_samples: int = 50,
     debug_cell_lines: Optional[List[str]] = None,
     debug_drugs: Optional[List[str]] = None,
     smiles_cache: Optional[Dict] = None,
@@ -187,9 +187,13 @@ def create_raw_drug_dataloader(
     """Create DataLoader for raw drug CSV data with biological conditioning"""
     
     # Load image paths
-    with open(image_json_path, 'r') as f:
-        image_json_dict = json.load(f)
-    
+    if image_json_path is not None:
+        with open(image_json_path, 'r') as f:
+            image_json_dict = json.load(f)
+    else:
+        image_json_dict = {}
+        logger.info("No image JSON path provided or file does not exist - proceeding without images")
+
     logger.info(f"drug_data_path={drug_data_path}")
 
     # Create dataset
@@ -237,7 +241,7 @@ def create_raw_drug_dataloader(
             
         dataset.gene_count_matrix = adata[:, hvg_genes].to_df().T
     
-    # Enhanced collate function
+    # collate function
     def conditional_collate_fn(batch):
         collated = {
             'control_transcriptomics': torch.stack([item['control_transcriptomics'] for item in batch]),
@@ -288,7 +292,6 @@ def create_raw_drug_dataloader(
         collate_fn=conditional_collate_fn,
         pin_memory=torch.cuda.is_available()
     )
-
 
 # if __name__ == '__main__':
 #     dataloader = create_raw_drug_dataloader(

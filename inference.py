@@ -75,6 +75,76 @@ def sample_with_cfg(model, flow, shape, y_full, pad_mask,
         x = x + dt * velocity 
     return x
 
+def exact_retrieval(query_features, training_data, top_k=5, similarity_metric='cosine'):
+    """Find most similar biological conditions and return corresponding molecules."""
+    
+    if not training_data['biological_features']:
+        return [], []
+    
+    # Concatenate all training features
+    all_training_features = torch.cat(training_data['biological_features'], dim=0)
+    
+    # Calculate similarities
+    query_flat = query_features.flatten(1)  # [B, features]
+    training_flat = all_training_features.flatten(1)  # [N, features]
+    
+    if similarity_metric == 'cosine':
+        from sklearn.metrics.pairwise import cosine_similarity
+        similarities = cosine_similarity(query_flat.cpu(), training_flat.cpu())
+    else:  # euclidean
+        distances = torch.cdist(query_flat, training_flat)
+        similarities = 1 / (1 + distances.cpu())
+    
+    # Get top-k similar conditions for each query
+    retrieved_smiles = []
+    similarity_scores = []
+    
+    for i in range(query_features.shape[0]):
+        sample_similarities = similarities[i]
+        top_indices = sample_similarities.argsort()[-top_k:][::-1]
+        
+        sample_smiles = [training_data['smiles'][idx] for idx in top_indices]
+        sample_scores = [sample_similarities[idx] for idx in top_indices]
+        
+        retrieved_smiles.append(sample_smiles)
+        similarity_scores.append(sample_scores)
+    
+    return retrieved_smiles, similarity_scores
+
+def estimate_generation_confidence(model, flow, x_final, y_features, pad_mask, device):
+    """Estimate confidence of generated molecules using multiple metrics."""
+    
+    with torch.no_grad():
+        # 1. Velocity consistency - check if we're at equilibrium
+        t_final = torch.ones(x_final.shape[0], device=device)
+        t_discrete = (t_final * 999).long()
+        final_velocity = model(x_final, t_discrete, y=y_features, pad_mask=pad_mask)
+        if final_velocity.shape[1] == 2 * x_final.shape[1]:
+            final_velocity, _ = torch.split(final_velocity, x_final.shape[1], dim=1)
+        
+        velocity_magnitude = torch.norm(final_velocity.flatten(1), dim=1)
+        velocity_confidence = torch.exp(-velocity_magnitude)  # Lower velocity = higher confidence
+        
+        # 2. Sampling consistency - generate multiple times and check agreement
+        consistency_samples = []
+        for _ in range(3):
+            sample = sample_with_cfg(model, flow, x_final.shape, y_features, pad_mask, 
+                                   num_steps=20, device=device)  # Fewer steps for speed
+            consistency_samples.append(sample)
+        
+        # Measure variance across samples
+        sample_stack = torch.stack(consistency_samples)
+        sample_variance = torch.var(sample_stack, dim=0).flatten(1).mean(1)
+        consistency_confidence = torch.exp(-sample_variance)
+        
+        # 3. Autoencoder reconstruction confidence (if you want to add this)
+        # This would require checking how well the latent reconstructs
+        
+        # Combine confidences
+        overall_confidence = (velocity_confidence + consistency_confidence) / 2
+        
+    return overall_confidence.cpu()
+
 class ComprehensiveMolecularEvaluator:
     """ molecular evaluation with multiple similarity metrics and baselines."""
     
@@ -625,10 +695,16 @@ def main(args):
 
     # Collect training SMILES for baselines and novelty calculation
     print("Collecting training SMILES for baselines...")
-    training_smiles = []
-    training_rna_signatures = []
-    
-    # Initialize evaluators (will collect training data during inference)
+    training_data = {
+        'smiles': [],
+        'biological_features': [],
+        'compound_names': [],
+        'rna_signatures': [],
+        'image_features': [],
+        'full_features': []
+    }
+
+    # Initialize evaluators
     mol_evaluator = ComprehensiveMolecularEvaluator(training_smiles=[])
     baseline_generator = BaselineGenerator([])
 
@@ -636,22 +712,22 @@ def main(args):
     results = []
     all_generated_smiles = []
     molecular_properties = []
-    training_smiles = []
-    training_rna_signatures = []
 
-    output_file = f'./inference_results_{args.global_seed}.txt'
-    detailed_output_file = f'./detailed_results_{args.global_seed}.json'
+    output_file = f'./inference_results_{args.inference_mode}_{args.global_seed}.txt'
+    detailed_output_file = f'./detailed_results_{args.inference_mode}_{args.global_seed}.json'
 
-    # header
+    # Update header to include method and confidence
     with open(output_file, 'w') as f:
-        f.write("target_smiles\tbest_generated\tcompound_name\tvalidity\t"
+        f.write("sample_id\ttarget_smiles\tcompound_name\tmethod\tconfidence\t"
+            "generation_confidence\tretrieval_similarity\tvalidity\t"
             "morgan_r2_sim\tmaccs_sim\trdk_sim\tscaffold_sim\t"
-            "novelty_score\tdrug_score\tmechanism_consistency\tnum_candidates\n")
+            "novelty_score\tdrug_score\tmechanism_consistency\tnum_candidates\tbest_generated\n")
 
     start_time = time.time()
 
-    # Generate molecules with evaluation (collect training data on-the-fly)
-    for batch_idx, batch in enumerate(tqdm(loader, desc="molecular generation")):
+    sample_counter = 0
+    # Main generation loop with multiple modes (replace the entire generation section)
+    for batch_idx, batch in enumerate(tqdm(loader, desc=f"Molecular {args.inference_mode}")):
         if batch_idx >= args.max_batches and args.max_batches > 0:
             break
             
@@ -662,145 +738,374 @@ def main(args):
         treatment_rna = batch['treatment_transcriptomics']
         target_smiles = batch['target_smiles']
         compound_names = batch['compound_name']
-        training_smiles.extend(target_smiles)
 
-        # Update the molecular evaluator with new training data
-        mol_evaluator.training_smiles = training_smiles
-
-        # Update baseline generator with collected data
-        baseline_generator.training_smiles = training_smiles
+        # Update training data storage
+        training_data['smiles'].extend(target_smiles)
+        training_data['compound_names'].extend(compound_names)
 
         y_features, pad_mask = dual_rna_image_encoder(
             control_imgs, treatment_imgs, control_rna, treatment_rna,
-            image_encoder, rna_encoder, device,
-            rna_dropout_prob=0.0, image_dropout_prob=0.0, training=False
+            image_encoder, rna_encoder, device
         )
+        
+        # Store training features for retrieval
+        training_data['biological_features'].append(y_features.cpu())
+        training_data['full_features'].extend([feat.cpu() for feat in y_features])
+        
+        # Extract RNA and image features separately
+        rna_features = y_features[:, :, 128:].mean(dim=1).cpu()
+        image_features = y_features[:, :, :128].mean(dim=1).cpu()
+        training_data['rna_signatures'].extend([feat.cpu() for feat in rna_features])
+        training_data['image_features'].extend([feat.cpu() for feat in image_features])
+
+        # Update evaluators with new training data
+        mol_evaluator.training_smiles = training_data['smiles']
+        baseline_generator.training_smiles = training_data['smiles']
         
         batch_size = y_features.shape[0]
         shape = (batch_size, in_channels, latent_size, 1)
         
-        # Generate multiple candidates per sample
-        all_generated = []
-        for sample_idx in range(args.num_samples_per_condition):
-
+        # MODE-SPECIFIC GENERATION
+        if args.inference_mode == 'retrieval':
+            # Pure retrieval mode
+            if len(training_data['full_features']) > batch_size:
+                # We have enough training data for retrieval
+                retrieved_smiles, similarity_scores = exact_retrieval(
+                    y_features, training_data, top_k=args.retrieval_top_k, 
+                    similarity_metric=args.similarity_metric
+                )
+                
+                # Process retrieved results
+                for i in range(batch_size):
+                    target = target_smiles[i]
+                    compound = compound_names[i]
+                    
+                    if retrieved_smiles[i]:
+                        best_candidate = retrieved_smiles[i][0]
+                        retrieval_confidence = similarity_scores[i][0]
+                        validity = 1 if best_candidate and best_candidate != "" else 0
+                        num_candidates = len([s for s in retrieved_smiles[i] if s and s != ""])
+                    else:
+                        best_candidate = ""
+                        retrieval_confidence = 0.0
+                        validity = 0
+                        num_candidates = 0
+                    
+                    # Evaluate retrieved molecule
+                    similarity_results = {}
+                    if validity and target:
+                        similarity_results = mol_evaluator.calculate_multi_fingerprint_similarity(target, best_candidate)
+                        similarity_results['scaffold_similarity'] = mol_evaluator.calculate_scaffold_similarity(target, best_candidate)
+                    
+                    novelty_score = mol_evaluator.calculate_novelty_score(best_candidate) if validity else 0.0
+                    mechanism_analysis = analyze_mechanism_consistency(compound, best_candidate, target)
+                    
+                    props = calculate_comprehensive_molecular_properties(best_candidate) if validity else {}
+                    drug_score = 0.0
+                    if props:
+                        # Calculate drug-likeness score
+                        drug_score = props.get('QED', 0) * 0.5 + (4 - sum([
+                            props['MW'] > 500, props['LogP'] > 5, 
+                            props.get('HBA', 0) > 10, props.get('HBD', 0) > 5
+                        ])) / 4 * 0.5
+                    
+                    result = {
+                        'method': 'retrieval',
+                        'target_smiles': target,
+                        'generated_smiles': best_candidate,
+                        'compound_name': compound,
+                        'confidence': float(retrieval_confidence),
+                        'generation_confidence': 0.0,
+                        'retrieval_similarity': float(retrieval_confidence),
+                        'validity': validity,
+                        'similarity_analysis': similarity_results,
+                        'novelty_score': novelty_score,
+                        'druglikeness_score': drug_score,
+                        'molecular_properties': props,
+                        'mechanism_analysis': mechanism_analysis,
+                        'num_candidates': num_candidates
+                    }
+                    results.append(result)
+            else:
+                # Not enough training data, return empty results
+                for i in range(batch_size):
+                    result = {
+                        'method': 'retrieval',
+                        'target_smiles': target_smiles[i],
+                        'generated_smiles': '',
+                        'compound_name': compound_names[i],
+                        'confidence': 0.0,
+                        'generation_confidence': 0.0,
+                        'retrieval_similarity': 0.0,
+                        'validity': 0,
+                        'similarity_analysis': {},
+                        'novelty_score': 0.0,
+                        'druglikeness_score': 0.0,
+                        'molecular_properties': {},
+                        'mechanism_analysis': {},
+                        'num_candidates': 0
+                    }
+                    results.append(result)
+        
+        elif args.inference_mode == 'generation':
+            # Pure generation mode
+            all_generated = []
+            all_confidences = []
+            
+            for sample_idx in range(args.num_samples_per_condition):
+                samples = sample_with_cfg(
+                    model=model, flow=flow, shape=shape, y_full=y_features, 
+                    pad_mask=pad_mask, cfg_scale_rna=2.0, cfg_scale_image=2.0,
+                    num_steps=args.num_sampling_steps, device=device
+                )
+                
+                # Estimate confidence for this generation
+                generation_confidence = estimate_generation_confidence(
+                    model, flow, samples, y_features, pad_mask, device
+                )
+                
+                samples = samples.squeeze(-1).permute((0, 2, 1))
+                generated_smiles = AE_SMILES_decoder(samples, ae_model, stochastic=False, k=1)
+                all_generated.append(generated_smiles)
+                all_confidences.append(generation_confidence)
+            
+            # Process generated results
+            for i in range(batch_size):
+                target = target_smiles[i]
+                compound = compound_names[i]
+                
+                # Collect all candidates for this sample
+                candidates_with_conf = []
+                for gen_idx in range(len(all_generated)):
+                    candidate = all_generated[gen_idx][i]
+                    confidence = all_confidences[gen_idx][i]
+                    candidates_with_conf.append((candidate, float(confidence)))
+                
+                # Validate candidates and select best
+                valid_candidates = []
+                for cand, conf in candidates_with_conf:
+                    try:
+                        if cand and cand != "":
+                            mol = Chem.MolFromSmiles(cand)
+                            if mol is not None:
+                                canonical = Chem.MolToSmiles(mol, canonical=True)
+                                valid_candidates.append((canonical, conf))
+                    except:
+                        continue
+                
+                if valid_candidates:
+                    # Select candidate with highest confidence
+                    best_candidate, best_confidence = max(valid_candidates, key=lambda x: x[1])
+                    validity = 1
+                    num_candidates = len(valid_candidates)
+                else:
+                    best_candidate = ""
+                    best_confidence = 0.0
+                    validity = 0
+                    num_candidates = 0
+                
+                # Evaluate generated molecule
+                similarity_results = {}
+                if validity and target:
+                    similarity_results = mol_evaluator.calculate_multi_fingerprint_similarity(target, best_candidate)
+                    similarity_results['scaffold_similarity'] = mol_evaluator.calculate_scaffold_similarity(target, best_candidate)
+                
+                novelty_score = mol_evaluator.calculate_novelty_score(best_candidate) if validity else 0.0
+                mechanism_analysis = analyze_mechanism_consistency(compound, best_candidate, target)
+                
+                props = calculate_comprehensive_molecular_properties(best_candidate) if validity else {}
+                drug_score = 0.0
+                if props:
+                    drug_score = props.get('QED', 0) * 0.5 + (4 - sum([
+                        props['MW'] > 500, props['LogP'] > 5,
+                        props.get('HBA', 0) > 10, props.get('HBD', 0) > 5
+                    ])) / 4 * 0.5
+                
+                result = {
+                    'method': 'generation',
+                    'target_smiles': target,
+                    'generated_smiles': best_candidate,
+                    'compound_name': compound,
+                    'confidence': float(best_confidence),
+                    'generation_confidence': float(best_confidence),
+                    'retrieval_similarity': 0.0,
+                    'validity': validity,
+                    'similarity_analysis': similarity_results,
+                    'novelty_score': novelty_score,
+                    'druglikeness_score': drug_score,
+                    'molecular_properties': props,
+                    'mechanism_analysis': mechanism_analysis,
+                    'num_candidates': num_candidates
+                }
+                results.append(result)
+        
+        elif args.inference_mode == 'adaptive':
+            # Adaptive mode - try generation first, fall back to retrieval if confidence is low
+            
+            # Generate first
             samples = sample_with_cfg(
-                model=model, flow=flow, shape=shape, y_full=y_features, 
-                pad_mask=pad_mask, cfg_scale_rna=2.0, cfg_scale_image=2.0,
+                model, flow, shape, y_features, pad_mask, 
+                cfg_scale_rna=2.0, cfg_scale_image=2.0,
                 num_steps=args.num_sampling_steps, device=device
+            )
+            
+            generation_confidence = estimate_generation_confidence(
+                model, flow, samples, y_features, pad_mask, device
             )
             
             samples = samples.squeeze(-1).permute((0, 2, 1))
             generated_smiles = AE_SMILES_decoder(samples, ae_model, stochastic=False, k=1)
-            all_generated.append(generated_smiles)
-        
-        # Process each sample in the batch
-        for i in range(batch_size):
-            candidates = [gen[i] for gen in all_generated]
-            target = target_smiles[i]
-            compound = compound_names[i]
             
-            # Validate candidates
-            valid_candidates = []
-            for cand in candidates:
+            # Get retrieval backup if we have enough training data
+            retrieved_smiles, retrieval_scores = [], []
+            if len(training_data['full_features']) > batch_size:
+                retrieved_smiles, retrieval_scores = exact_retrieval(
+                    y_features, training_data, top_k=1, similarity_metric=args.similarity_metric
+                )
+            
+            # Process each sample
+            for i in range(batch_size):
+                target = target_smiles[i]
+                compound = compound_names[i]
+                
+                gen_conf = generation_confidence[i]
+                generated_candidate = generated_smiles[i]
+                
+                # Check generation validity
+                gen_valid = False
                 try:
-                    if cand and cand != "":
-                        mol = Chem.MolFromSmiles(cand)
+                    if generated_candidate and generated_candidate != "":
+                        mol = Chem.MolFromSmiles(generated_candidate)
                         if mol is not None:
-                            canonical = Chem.MolToSmiles(mol, canonical=True)
-                            valid_candidates.append(canonical)
+                            generated_candidate = Chem.MolToSmiles(mol, canonical=True)
+                            gen_valid = True
                 except:
-                    continue
-            
-            # Remove duplicates
-            valid_candidates = list(dict.fromkeys(valid_candidates))
-            all_generated_smiles.extend(valid_candidates)
-            
-            # Rank by comprehensive drug-likeness
-            if valid_candidates:
-                ranked_candidates = rank_candidates_by_comprehensive_score(valid_candidates)
-                if ranked_candidates:
-                    best_candidate = ranked_candidates[0][0]
-                    best_score = ranked_candidates[0][1]
-                    best_props = ranked_candidates[0][2]
+                    pass
+                
+                # Decision logic for adaptive mode
+                use_generation = (gen_conf >= args.confidence_threshold and gen_valid)
+                
+                if use_generation:
+                    # Use generation
+                    best_candidate = generated_candidate
+                    method = 'generation'
+                    confidence = float(gen_conf)
+                    retrieval_sim = 0.0
                     validity = 1
                 else:
-                    best_candidate = valid_candidates[0]
-                    best_score = 0
-                    best_props = {}
-                    validity = 1
-            else:
-                best_candidate = ""
-                best_score = 0
-                best_props = {}
-                validity = 0
-            
-            # similarity analysis
-            similarity_results = {}
-            if validity and target:
-                similarity_results = mol_evaluator.calculate_multi_fingerprint_similarity(
-                    target, best_candidate
-                )
-                similarity_results['scaffold_similarity'] = mol_evaluator.calculate_scaffold_similarity(
-                    target, best_candidate
-                )
-                similarity_results['substructure_analysis'] = mol_evaluator.analyze_substructure_overlap(
-                    target, best_candidate
-                )
-            
-            # Novelty analysis
-            novelty_score = mol_evaluator.calculate_novelty_score(best_candidate) if validity else 0.0
-            
-            # Mechanism consistency
-            mechanism_analysis = analyze_mechanism_consistency(compound, best_candidate, target)
-
-            # Diversity analysis
-            diversity_results = diversity_analysis(valid_candidates)
-            
-            # Generate baselines for comparison
-            random_baseline = baseline_generator.generate_random_baseline(5)
-            structure_baseline = baseline_generator.generate_structure_similar_baseline(target, 3)
-            
-            # Store comprehensive results
-            result = {
-                'target_smiles': target,
-                'generated_smiles': best_candidate,
-                'compound_name': compound,
-                'all_candidates': valid_candidates,
-                'validity': validity,
-                'similarity_analysis': similarity_results,
-                'novelty_score': novelty_score,
-                'druglikeness_score': best_score,
-                'molecular_properties': best_props,
-                'diversity_analysis': diversity_results,
-                'mechanism_analysis': mechanism_analysis,
-                'baselines': {
-                    'random': random_baseline,
-                    'structure_similar': structure_baseline
-                },
-                'num_candidates': len(valid_candidates)
-            }
-            results.append(result)
-            
-            if best_props:
-                molecular_properties.append(best_props)
-            
-            # Write output
-            with open(output_file, 'a') as f:
-                morgan_sim = similarity_results.get('morgan_r2', 0.0)
-                maccs_sim = similarity_results.get('maccs', 0.0)
-                rdk_sim = similarity_results.get('rdk', 0.0)
-                scaffold_sim = similarity_results.get('scaffold_similarity', 0.0)
-                mechanism_score = mechanism_analysis.get('mechanism_consistency_score', 0.0)
+                    # Fall back to retrieval
+                    if retrieved_smiles and i < len(retrieved_smiles) and retrieved_smiles[i]:
+                        best_candidate = retrieved_smiles[i][0]
+                        method = 'retrieval_fallback'
+                        confidence = float(retrieval_scores[i][0]) if retrieval_scores[i] else 0.0
+                        retrieval_sim = confidence
+                        validity = 1 if best_candidate and best_candidate != "" else 0
+                    else:
+                        best_candidate = ""
+                        method = 'retrieval_fallback'
+                        confidence = 0.0
+                        retrieval_sim = 0.0
+                        validity = 0
                 
-                f.write(f"{target}\t{best_candidate}\t{compound}\t{validity}\t"
-                       f"{morgan_sim:.3f}\t{maccs_sim:.3f}\t{rdk_sim:.3f}\t{scaffold_sim:.3f}\t"
-                       f"{novelty_score:.3f}\t{best_score:.3f}\t{mechanism_score:.3f}\t"
-                       f"{len(valid_candidates)}\n")
+                # Evaluate final molecule
+                similarity_results = {}
+                if validity and target:
+                    similarity_results = mol_evaluator.calculate_multi_fingerprint_similarity(target, best_candidate)
+                    similarity_results['scaffold_similarity'] = mol_evaluator.calculate_scaffold_similarity(target, best_candidate)
+                
+                novelty_score = mol_evaluator.calculate_novelty_score(best_candidate) if validity else 0.0
+                mechanism_analysis = analyze_mechanism_consistency(compound, best_candidate, target)
+                
+                props = calculate_comprehensive_molecular_properties(best_candidate) if validity else {}
+                drug_score = 0.0
+                if props:
+                    drug_score = props.get('QED', 0) * 0.5 + (4 - sum([
+                        props['MW'] > 500, props['LogP'] > 5,
+                        props.get('HBA', 0) > 10, props.get('HBD', 0) > 5
+                    ])) / 4 * 0.5
+                
+                result = {
+                    'method': method,
+                    'target_smiles': target,
+                    'generated_smiles': best_candidate,
+                    'compound_name': compound,
+                    'confidence': confidence,
+                    'generation_confidence': float(gen_conf),
+                    'retrieval_similarity': retrieval_sim,
+                    'validity': validity,
+                    'similarity_analysis': similarity_results,
+                    'novelty_score': novelty_score,
+                    'druglikeness_score': drug_score,
+                    'molecular_properties': props,
+                    'mechanism_analysis': mechanism_analysis,
+                    'num_candidates': 1
+                }
+                results.append(result)
+        
+        # Write results to file for this batch
+        for result in results[-batch_size:]:  # Only process the results from this batch
+            target = result['target_smiles']
+            best_candidate = result['generated_smiles']
+            compound = result['compound_name']
+            method = result['method']
+            confidence = result['confidence']
+            gen_conf = result['generation_confidence']
+            ret_sim = result['retrieval_similarity']
+            validity = result['validity']
+            
+            # Get similarity scores
+            sim_analysis = result.get('similarity_analysis', {})
+            morgan_sim = sim_analysis.get('morgan_r2', 0.0)
+            maccs_sim = sim_analysis.get('maccs', 0.0)
+            rdk_sim = sim_analysis.get('rdk', 0.0)
+            scaffold_sim = sim_analysis.get('scaffold_similarity', 0.0)
+            
+            novelty_score = result.get('novelty_score', 0.0)
+            drug_score = result.get('druglikeness_score', 0.0)
+            mechanism_score = result.get('mechanism_analysis', {}).get('mechanism_consistency_score', 0.0)
+            num_candidates = result.get('num_candidates', 0)
+            
+            with open(output_file, 'a') as f:
+                sample_counter += 1
+                f.write(f"{sample_counter}\t{target}\t{compound}\t{method}\t{confidence:.3f}\t"
+                    f"{gen_conf:.3f}\t{ret_sim:.3f}\t{validity}\t"
+                    f"{morgan_sim:.3f}\t{maccs_sim:.3f}\t{rdk_sim:.3f}\t{scaffold_sim:.3f}\t"
+                    f"{novelty_score:.3f}\t{drug_score:.3f}\t{mechanism_score:.3f}\t{num_candidates}\t{best_candidate}\n")
 
-    # Calculate comprehensive metrics
+    # Calculate comprehensive metrics (replace the final summary section)
     total_time = time.time() - start_time
     valid_results = [r for r in results if r['validity'] == 1]
     validity_rate = len(valid_results) / len(results) if results else 0
+    
+    # Method distribution
+    method_counts = {}
+    for r in results:
+        method = r.get('method', 'unknown')
+        method_counts[method] = method_counts.get(method, 0) + 1
+    
+    # Confidence statistics by method
+    confidence_stats = {}
+    generation_confidence_stats = {}
+    
+    for method in ['retrieval', 'generation', 'retrieval_fallback']:
+        method_results = [r for r in results if r.get('method') == method]
+        if method_results:
+            confidences = [r['confidence'] for r in method_results]
+            confidence_stats[method] = {
+                'mean': np.mean(confidences),
+                'std': np.std(confidences), 
+                'min': np.min(confidences),
+                'max': np.max(confidences)
+            }
+            
+            if method in ['generation', 'retrieval_fallback']:
+                gen_confs = [r['generation_confidence'] for r in method_results]
+                generation_confidence_stats[method] = {
+                    'mean': np.mean(gen_confs),
+                    'std': np.std(gen_confs),
+                    'min': np.min(gen_confs),
+                    'max': np.max(gen_confs)
+                }
     
     # Multi-fingerprint similarity averages
     similarity_averages = {}
@@ -809,11 +1114,16 @@ def main(args):
                  if 'similarity_analysis' in r]
         similarity_averages[sim_type] = np.mean(values) if values else 0.0
     
+    scaffold_similarities = [r['similarity_analysis'].get('scaffold_similarity', 0) for r in valid_results 
+                           if 'similarity_analysis' in r]
+    avg_scaffold_similarity = np.mean(scaffold_similarities) if scaffold_similarities else 0.0
+    
     avg_novelty = np.mean([r['novelty_score'] for r in valid_results]) if valid_results else 0
     avg_druglikeness = np.mean([r['druglikeness_score'] for r in valid_results]) if valid_results else 0
     
-    # property statistics
+    # Property statistics
     property_stats = {}
+    molecular_properties = [r['molecular_properties'] for r in valid_results if r.get('molecular_properties')]
     if molecular_properties:
         extended_props = ['MW', 'LogP', 'HBA', 'HBD', 'TPSA', 'QED', 'BertzCT', 'NumRings']
         for prop in extended_props:
@@ -826,18 +1136,47 @@ def main(args):
                     'max': np.max(values)
                 }
     
-    # Print results
-    print(f"\n{'='*100}")
-    print(f"COMPREHENSIVE MOLECULAR GENERATION EVALUATION")
-    print(f"{'='*100}")
-    print(f"Dataset Statistics:")
+    # Generate all SMILES for diversity analysis
+    all_generated_smiles = [r['generated_smiles'] for r in valid_results if r['generated_smiles']]
+    
+    # Print results with mode-specific information
+    print(f"\n{'='*120}")
+    print(f"COMPREHENSIVE MOLECULAR {args.inference_mode.upper()} EVALUATION")
+    print(f"{'='*120}")
+    
+    print(f"Mode Configuration:")
+    print(f"  Inference mode: {args.inference_mode}")
+    if args.inference_mode == 'adaptive':
+        print(f"  Confidence threshold: {args.confidence_threshold}")
+    if args.inference_mode in ['retrieval', 'adaptive']:
+        print(f"  Retrieval top-k: {args.retrieval_top_k}")
+        print(f"  Similarity metric: {args.similarity_metric}")
+    
+    print(f"\nDataset Statistics:")
     print(f"  Total samples: {len(results)}")
     print(f"  Valid molecules: {len(valid_results)}/{len(results)} ({validity_rate:.1%})")
     print(f"  Processing time: {total_time:.1f}s ({total_time/len(results):.2f}s/sample)")
     
+    print(f"\nMethod Distribution:")
+    for method, count in method_counts.items():
+        percentage = count / len(results) * 100
+        print(f"  {method}: {count}/{len(results)} ({percentage:.1f}%)")
+    
+    print(f"\nConfidence Analysis:")
+    for method, stats in confidence_stats.items():
+        print(f"  {method} confidence: {stats['mean']:.3f} ± {stats['std']:.3f} "
+              f"(range: {stats['min']:.3f}-{stats['max']:.3f})")
+    
+    if args.inference_mode == 'adaptive':
+        print(f"\nGeneration Confidence Analysis (for adaptive mode):")
+        for method, stats in generation_confidence_stats.items():
+            print(f"  {method} generation confidence: {stats['mean']:.3f} ± {stats['std']:.3f} "
+                  f"(range: {stats['min']:.3f}-{stats['max']:.3f})")
+    
     print(f"\nMulti-Fingerprint Similarity Analysis:")
     for sim_type, avg_sim in similarity_averages.items():
         print(f"  {sim_type.upper()}: {avg_sim:.3f}")
+    print(f"  Scaffold similarity: {avg_scaffold_similarity:.3f}")
     
     print(f"\nNovelty and Drug-likeness:")
     print(f"  Average novelty score: {avg_novelty:.3f}")
@@ -850,10 +1189,10 @@ def main(args):
     print(f"  Property diversity: {overall_diversity.get('property_diversity', 0):.3f}")
     print(f"  Unique scaffolds: {overall_diversity.get('num_unique_scaffolds', 0)}")
     
-    print(f"\nMechanism Consistency Analysis:")
     mechanism_scores = [r['mechanism_analysis']['mechanism_consistency_score'] 
                        for r in valid_results if 'mechanism_analysis' in r]
     if mechanism_scores:
+        print(f"\nMechanism Consistency Analysis:")
         print(f"  Average mechanism consistency: {np.mean(mechanism_scores):.3f}")
     
     print(f"\nExtended Molecular Property Statistics:")
@@ -861,37 +1200,51 @@ def main(args):
         print(f"  {prop}: {stats['mean']:.2f} ± {stats['std']:.2f} "
               f"(range: {stats['min']:.2f}-{stats['max']:.2f})")
     
-    print(f"\nTop Generated Examples (by drug-likeness):")
-    sorted_results = sorted(valid_results, key=lambda x: x['druglikeness_score'], reverse=True)
+    # Show top examples by method and confidence/similarity
+    print(f"\nTop Examples by Method:")
     
-    for i, result in enumerate(sorted_results[:3]):
-        print(f"\nExample {i+1}:")
-        print(f"  Target compound: {result['compound_name']}")
-        print(f"  Generated: {result['generated_smiles']}")
-        print(f"  Target:    {result['target_smiles']}")
+    for method in method_counts.keys():
+        method_results = [r for r in valid_results if r.get('method') == method]
+        if not method_results:
+            continue
+            
+        # Sort by confidence for generation, by similarity for retrieval
+        if method == 'generation':
+            sorted_method_results = sorted(method_results, key=lambda x: x['confidence'], reverse=True)
+        else:
+            sorted_method_results = sorted(method_results, key=lambda x: x.get('retrieval_similarity', x['confidence']), reverse=True)
         
-        sim_analysis = result.get('similarity_analysis', {})
-        print(f"  Similarities: Morgan={sim_analysis.get('morgan_r2', 0):.3f}, "
-              f"MACCS={sim_analysis.get('maccs', 0):.3f}, "
-              f"Scaffold={sim_analysis.get('scaffold_similarity', 0):.3f}")
-        
-        print(f"  Novelty: {result['novelty_score']:.3f}")
-        print(f"  Drug-likeness: {result['druglikeness_score']:.3f}")
-        
-        if result['molecular_properties']:
-            props = result['molecular_properties']
-            print(f"  Properties: MW={props['MW']:.1f}, LogP={props['LogP']:.2f}, "
-                  f"QED={props['QED']:.2f}, Complexity={props.get('BertzCT', 0):.1f}")
+        print(f"\n{method.upper()} - Top Example:")
+        if sorted_method_results:
+            result = sorted_method_results[0]
+            print(f"  Target compound: {result['compound_name']}")
+            print(f"  Generated: {result['generated_smiles']}")
+            print(f"  Target:    {result['target_smiles']}")
+            
+            sim_analysis = result.get('similarity_analysis', {})
+            print(f"  Similarities: Morgan={sim_analysis.get('morgan_r2', 0):.3f}, "
+                  f"MACCS={sim_analysis.get('maccs', 0):.3f}, "
+                  f"Scaffold={sim_analysis.get('scaffold_similarity', 0):.3f}")
+            
+            print(f"  Confidence: {result['confidence']:.3f}")
+            if result.get('generation_confidence', 0) > 0:
+                print(f"  Generation confidence: {result['generation_confidence']:.3f}")
+            print(f"  Novelty: {result['novelty_score']:.3f}")
+            print(f"  Drug-likeness: {result['druglikeness_score']:.3f}")
     
-    print(f"\n{'='*100}")
+    print(f"\n{'='*120}")
     print(f"Results saved to: {output_file}")
     
     # Save comprehensive detailed results
     comprehensive_summary = {
         'evaluation_metadata': {
-            'evaluation_type': 'comprehensive_molecular_generation',
+            'evaluation_type': f'comprehensive_molecular_{args.inference_mode}',
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
             'parameters': {
+                'inference_mode': args.inference_mode,
+                'confidence_threshold': args.confidence_threshold if args.inference_mode == 'adaptive' else None,
+                'retrieval_top_k': args.retrieval_top_k,
+                'similarity_metric': args.similarity_metric,
                 'num_samples_per_condition': args.num_samples_per_condition,
                 'num_sampling_steps': args.num_sampling_steps,
                 'global_seed': args.global_seed
@@ -901,9 +1254,14 @@ def main(args):
             'total_samples': len(results),
             'valid_molecules': len(valid_results),
             'validity_rate': validity_rate,
-            'processing_time': total_time
+            'processing_time': total_time,
+            'method_distribution': method_counts
         },
-        'similarity_analysis': similarity_averages,
+        'confidence_analysis': {
+            'confidence_stats': confidence_stats,
+            'generation_confidence_stats': generation_confidence_stats
+        },
+        'similarity_analysis': {**similarity_averages, 'scaffold_similarity': avg_scaffold_similarity},
         'novelty_and_druglikeness': {
             'average_novelty': avg_novelty,
             'average_druglikeness': avg_druglikeness,
@@ -913,23 +1271,34 @@ def main(args):
         'mechanism_analysis': {
             'average_mechanism_consistency': np.mean(mechanism_scores) if mechanism_scores else 0.0
         },
-        'top_examples': sorted_results[:10] if sorted_results else [],
         'training_set_info': {
-            'num_training_molecules': len(training_smiles),
-            'unique_training_molecules': len(set(training_smiles))
+            'num_training_molecules': len(training_data['smiles']),
+            'unique_training_molecules': len(set(training_data['smiles']))
         }
     }
+    
+    # Add top examples by method
+    for method in method_counts.keys():
+        method_results = [r for r in valid_results if r.get('method') == method]
+        if method_results:
+            if method == 'generation':
+                sorted_method_results = sorted(method_results, key=lambda x: x['confidence'], reverse=True)
+            else:
+                sorted_method_results = sorted(method_results, key=lambda x: x.get('retrieval_similarity', x['confidence']), reverse=True)
+            comprehensive_summary[f'top_{method}_examples'] = sorted_method_results[:5]
     
     with open(detailed_output_file, 'w') as f:
         json.dump(comprehensive_summary, f, indent=2, default=str)
     
     print(f"Comprehensive results saved to: {detailed_output_file}")
-
+    print(f"Mode used: {args.inference_mode}")
+    
+    return results
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="LDMol")
-    parser.add_argument("--ckpt", type=str, default='/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/results/004-LDMol/checkpoints/0040000.pt')
+    parser.add_argument("--ckpt", type=str, default='/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/results/001-LDMol/checkpoints/0050000.pt')
     parser.add_argument("--vae", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/src_new/LDMol/dataloaders/checkpoint_autoencoder.ckpt")
     
     # Data paths
@@ -942,11 +1311,21 @@ if __name__ == "__main__":
     
     # Generation parameters
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--num-samples-per-condition", type=int, default=8)
+    parser.add_argument("--num-samples-per-condition", type=int, default=3)
     parser.add_argument("--num-sampling-steps", type=int, default=50)
     parser.add_argument("--max-batches", type=int, default=50)
     parser.add_argument("--global-seed", type=int, default=42)
     parser.add_argument("--debug-mode", action="store_true")
+    
+    # New inference mode arguments
+    parser.add_argument("--inference-mode", type=str, choices=['retrieval', 'generation', 'adaptive'], 
+                       default='generation', help='Inference mode: retrieval, generation, or adaptive')
+    parser.add_argument("--confidence-threshold", type=float, default=0.7,
+                       help='Confidence threshold for adaptive mode (0-1)')
+    parser.add_argument("--retrieval-top-k", type=int, default=3,
+                       help='Number of similar conditions to consider for retrieval')
+    parser.add_argument("--similarity-metric", type=str, choices=['cosine', 'euclidean'], default='cosine',
+                       help='Similarity metric for retrieval mode')
     
     args = parser.parse_args()
     main(args)

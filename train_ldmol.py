@@ -36,11 +36,6 @@ from dataloaders.dataset_gdp import create_raw_drug_dataloader
 from dataloaders.download import download_model, find_model
 from diffusion.rectified_flow import create_rectified_flow
 
-#################################################################################
-#                             Training Helper Functions                         #
-#################################################################################
-
-
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
     """
@@ -53,7 +48,6 @@ def update_ema(ema_model, model, decay=0.9999):
         # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
-
 def requires_grad(model, flag=True):
     """
     Set requires_grad flag for all parameters in a model.
@@ -61,13 +55,11 @@ def requires_grad(model, flag=True):
     for p in model.parameters():
         p.requires_grad = flag
 
-
 def cleanup():
     """
     End DDP training.
     """
     dist.destroy_process_group()
-
 
 def create_logger(logging_dir):
     """
@@ -85,7 +77,6 @@ def create_logger(logging_dir):
         logger = logging.getLogger(__name__)
         logger.addHandler(logging.NullHandler())
     return logger
-
 
 def sample_with_cfg(model, flow, shape, y_full, pad_mask, 
                    cfg_scale_rna=1.0, cfg_scale_image=1.0, 
@@ -164,10 +155,6 @@ def sample_with_cfg(model, flow, shape, y_full, pad_mask,
     
     return x
     
-#################################################################################
-#                                  Training Loop                                #
-#################################################################################
-
 def main(args):
     """
     Trains a new DiT model with flexible single/multi-GPU support.
@@ -342,8 +329,8 @@ def main(args):
         batch_size=batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        compound_name_label='compound',
-        debug_mode=False,
+        compound_name_label=args.compound_name_label,
+        debug_mode=args.debug_mode,
     )
 
     # Prepare models for training
@@ -462,7 +449,6 @@ def main(args):
     if use_ddp:
         cleanup()
 
-
 if __name__ == "__main__":
     # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
@@ -478,19 +464,33 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=10000)
     parser.add_argument("--use-distributed", action="store_true", help="Enable distributed training across multiple GPUs")
     
-    parser.add_argument("--image-json-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/image_paths.json")
-    parser.add_argument("--drug-data-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/drug/PubChem/GDP_compatible/preprocessed_drugs.synonymous.pkl")
-    parser.add_argument("--raw-drug-csv-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/DrugGFN/PertRF/drug/PubChem/GDP_compatible/complete_drug_data.csv")
-    parser.add_argument("--metadata-control-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/metadata_control.csv")
-    parser.add_argument("--metadata-drug-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/metadata_drug.csv")
-    parser.add_argument("--gene-count-matrix-path", type=str, default="/depot/natallah/data/Mengbo/HnE_RNA/PertRF/data/processed_data/GDPx1x2_gene_counts.parquet")
-    
-    args = parser.parse_args()
+    parser.add_argument("--image-json-path", type=str, default=None)
+    parser.add_argument("--drug-data-path", type=str, default=None)
+    parser.add_argument("--raw-drug-csv-path", type=str, default=None)
+    parser.add_argument("--metadata-control-path", type=str, default=None)
+    parser.add_argument("--metadata-drug-path", type=str, default=None)
+    parser.add_argument("--gene-count-matrix-path", type=str, default=None)
+    parser.add_argument("--compound-name-label", type=str, default="compound")
+    parser.add_argument("--transpose-gene-count-matrix", action='store_true', default=False)
+    parser.add_argument("--debug-mode", action='store_true', default=False)
 
+    args = parser.parse_args()
     print(args)
+
+    for i in ["image_json_path", "gene_count_matrix_path"]:
+        try:
+            if args.__dict__[i] is not None:
+                assert os.path.exists(args.__dict__[i]), f"Cannot find {args.__dict__[i]}."
+        except Exception as e:
+            print(e, f"; Reset {i} to None")
+            args.__dict__[i] = None
+    assert not (args.image_json_path is None and args.gene_count_matrix_path is None), "Warning: Both image_json_path and gene_count_matrix_path are None. At least one must be provided."
     
     metadata_control = pd.read_csv(args.metadata_control_path)
     metadata_drug = pd.read_csv(args.metadata_drug_path)
     gene_count_matrix = pd.read_parquet(args.gene_count_matrix_path)
+
+    if args.transpose_gene_count_matrix:
+        gene_count_matrix = gene_count_matrix.T
 
     main(args)

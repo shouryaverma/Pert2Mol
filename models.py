@@ -19,10 +19,8 @@ from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 from timm.layers import use_fused_attn
 import einops
 
-
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-
 
 class CrossAttention(nn.Module):
     fused_attn: Final[bool]
@@ -87,11 +85,6 @@ class CrossAttention(nn.Module):
         # print('cross', x.shape, y.shape, pad_mask.shape, pad_mask[0])
         return x
 
-
-#################################################################################
-#               Embedding Layers for Timesteps and Class Labels                 #
-#################################################################################
-
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
@@ -116,7 +109,6 @@ class TimestepEmbedder(nn.Module):
         :param max_period: controls the minimum frequency of the embeddings.
         :return: an (N, D) Tensor of positional embeddings.
         """
-        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
         half = dim // 2
         freqs = torch.exp(
             -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
@@ -131,11 +123,6 @@ class TimestepEmbedder(nn.Module):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb
-
-
-#################################################################################
-#                                 Core DiT Model                                #
-#################################################################################
 
 class DiTBlock(nn.Module):
     """
@@ -170,7 +157,6 @@ class DiTBlock(nn.Module):
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
-
 class FinalLayer(nn.Module):
     """
     The final layer of DiT.
@@ -190,7 +176,6 @@ class FinalLayer(nn.Module):
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
-
 
 class DiT(nn.Module):
     """
@@ -241,17 +226,8 @@ class DiT(nn.Module):
         self.apply(_basic_init)
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
-        # pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], self.input_size)  # int(self.x_embedder.num_patches ** 0.5)
         pos_embed = get_1d_sincos_pos_embed_from_grid(self.pos_embed.shape[-1], np.arange(self.input_size))
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-
-        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
-        # w = self.x_embedder.proj.weight.data
-        # nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        # nn.init.constant_(self.x_embedder.proj.bias, 0)
-
-        # Initialize label embedding table:
-        # nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -315,29 +291,14 @@ class DiT(nn.Module):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
-        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        # print('bb', combined.shape, t.shape, y.shape, pad_mask.shape)
         model_out = self.forward(combined, t, y, pad_mask)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
         eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
-        # eps, rest = model_out[:, :3], model_out[:, 3:]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-        # print(cond_eps[0, 0, :8])
-        # print(uncond_eps[0, 0, :8])
-        # raise NotImplementedError
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
         return torch.cat([eps, rest], dim=1)
-
-
-#################################################################################
-#                   Sine/Cosine Positional Embedding Functions                  #
-#################################################################################
-# https://github.com/facebookresearch/mae/blob/main/util/pos_embed.py
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
     """
@@ -357,7 +318,6 @@ def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=
         pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)
     return pos_embed
 
-
 def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
     assert embed_dim % 2 == 0
 
@@ -367,7 +327,6 @@ def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
 
     emb = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
     return emb
-
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     """
@@ -388,11 +347,6 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
     emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
     return emb
-
-
-#################################################################################
-#                                   DiT Configs                                 #
-#################################################################################
 
 def LDMol(**kwargs):
     return DiT(depth=12, hidden_size=768, patch_size=1, num_heads=16, **kwargs)

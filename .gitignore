@@ -3,4 +3,7 @@
 *.out
 *.pt
 *.txt
+*.json
+*.tsv
+*.sh
 results/

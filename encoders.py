@@ -68,9 +68,7 @@ class RNAEncoder(nn.Module):
     """
     def __init__(self, input_dim, hidden_dims=[512, 256], output_dim=256, 
                 dropout=0.1, use_gene_relations=False, num_heads=4, relation_rank=25,
-                gene_embed_dim=512, num_attention_layers=1,
-                use_kg=False, kg_processor=None, kg_data=None, 
-                gene_to_kg_mapping=None, gene_names=None):
+                gene_embed_dim=512, num_attention_layers=1):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -78,29 +76,6 @@ class RNAEncoder(nn.Module):
         self.num_heads = num_heads
         self.relation_rank = relation_rank
         self.gene_embed_dim = gene_embed_dim
-        self.use_kg = use_kg
-        
-        # ===== KG INTEGRATION =====
-        if use_kg and kg_processor is not None and kg_data is not None and gene_to_kg_mapping is not None:
-            # Create PrimeKGEncoder internally (same pattern as DrugEmbedding)
-            kg_encoder = PrimeKGEncoder(
-                node_features=kg_data['num_nodes_per_type'],
-                relation_types=list(kg_data['edge_mappings'].keys()),
-                hidden_dim=256,
-                output_dim=128,
-                num_layers=3
-            )
-            
-            self.kg_gene_encoder = KnowledgeGraphGeneEncoder(
-                kg_encoder=kg_encoder,
-                gene_to_kg_mapping=gene_to_kg_mapping,
-                gene_names=gene_names or [f"gene_{i}" for i in range(input_dim)],
-                kg_embed_dim=128,
-                output_dim=gene_embed_dim,
-                kg_data=kg_data
-            )
-        else:
-            self.kg_gene_encoder = None
         
         # Project raw gene expressions to embedding space for attention
         self.gene_embedding = nn.Sequential(
@@ -110,7 +85,6 @@ class RNAEncoder(nn.Module):
             nn.LayerNorm(gene_embed_dim)
         )
 
-        self.gene_names = gene_names
         self.gene_relation_projection = nn.Linear(gene_embed_dim, 1)
         
         # Multi-layer self-attention for genes
@@ -190,7 +164,6 @@ class RNAEncoder(nn.Module):
         )
 
         # Apply transformation to mean-pooled gene features for relations
-        # gene_values = x_attended.mean(dim=-1)  # [B, G] - average over embedding dim
         gene_values = self.gene_relation_projection(x_attended).squeeze(-1)  # [B, G]
         gene_values_unsqueezed = gene_values.unsqueeze(1)  # [B, 1, G]
         temp = torch.bmm(gene_values_unsqueezed, U)  # [B, 1, K]
@@ -222,41 +195,6 @@ class RNAEncoder(nn.Module):
         # Embed each gene expression individually
         x_reshaped = x.unsqueeze(-1)  # [B, G, 1]
         gene_embeds = self.gene_embedding(x_reshaped)  # [B, G, embed_dim]
-        
-        # ===== KG ENHANCEMENT =====
-        if self.use_kg and self.kg_gene_encoder is not None:
-            # Get edge dict from the gene encoder if it exists
-            if hasattr(self.kg_gene_encoder, 'get_kg_edge_dict'):
-                edge_index_dict = self.kg_gene_encoder.get_kg_edge_dict()
-            else:
-                edge_index_dict = {}
-            
-            # CRITICAL FIX: Only use genes for the current filtered subset
-            if hasattr(self, 'gene_names') and self.gene_names:
-                gene_subset = self.gene_names[:num_genes]  # Take only what we need
-            else:
-                gene_subset = [f"gene_{i}" for i in range(num_genes)]
-            
-            # Get KG-enhanced gene embeddings for ONLY the current subset
-            kg_gene_embeds = self.kg_gene_encoder.get_gene_kg_embeddings(
-                gene_subset=gene_subset,
-                edge_index_dict=edge_index_dict
-            )  # Should be [num_genes, embed_dim]
-            
-            # Ensure KG embeddings match the current gene count
-            if kg_gene_embeds.shape[0] != num_genes:
-                # If mismatch, truncate or pad to match
-                if kg_gene_embeds.shape[0] > num_genes:
-                    kg_gene_embeds = kg_gene_embeds[:num_genes]
-                else:
-                    # Pad with zeros if needed
-                    padding = torch.zeros(num_genes - kg_gene_embeds.shape[0], kg_gene_embeds.shape[1], 
-                                        device=kg_gene_embeds.device)
-                    kg_gene_embeds = torch.cat([kg_gene_embeds, padding], dim=0)
-            
-            # Broadcast to batch size and add to regular embeddings
-            kg_gene_embeds = kg_gene_embeds.unsqueeze(0).expand(batch_size, -1, -1)
-            gene_embeds = gene_embeds + 0.3 * kg_gene_embeds
         
         # Apply multi-layer self-attention between genes
         attention_weights_all = []
@@ -296,7 +234,6 @@ class RNAEncoder(nn.Module):
             # Embed genes
             x_reshaped = x.unsqueeze(-1)
             gene_embeds = self.gene_embedding(x_reshaped)
-            gene_embeds = gene_embeds + self.gene_position_embed.unsqueeze(0)
             
             # Get attention weights from each layer
             attention_weights_all = []
